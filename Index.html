@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+  <title>แผนส่งมอบบ้าน</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Prompt:wght@300;400;500;600&display=swap" rel="stylesheet">
+  <?!= include('Stylesheet'); ?>
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-logo" id="brand-logo"></div>
+        <div>
+          <div class="brand-name">แผนส่งมอบบ้าน</div>
+          <div class="brand-sub">ติดตามงานซ่อม &amp; ส่งมอบ</div>
+        </div>
+      </div>
+      <nav class="side-nav" id="side-nav"></nav>
+      <div class="side-foot" id="side-foot"></div>
+    </aside>
+
+    <div class="main-wrap">
+      <header class="topbar">
+        <div class="brand compact">
+          <div class="brand-logo" id="brand-logo-m"></div>
+          <div class="brand-name">แผนส่งมอบบ้าน</div>
+        </div>
+        <button class="icon-btn" data-act="refresh" title="โหลดข้อมูลใหม่" id="btn-refresh-m"></button>
+      </header>
+      <div id="demo-banner"></div>
+      <main id="view" class="view"></main>
+    </div>
+
+    <nav class="bottom-nav" id="bottom-nav"></nav>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="lightbox-root"></div>
+  <div id="toast-root" class="toast-root"></div>
+  <input type="file" id="file-input" accept="image/*" multiple hidden>
+
+  <div id="loading" class="loading-screen">
+    <div class="spinner"></div>
+    <div class="loading-text">กำลังโหลดข้อมูล…</div>
+  </div>
+
+  <?!= include('JavaScript'); ?>
+</body>
+</html>

@@ -1,0 +1,1507 @@
+<script>
+/* ============================================================
+   แผนส่งมอบบ้าน — Front-end (Single Page App)
+   โครงสร้าง:
+     1) Config & State      5) Views (หน้าจอ)
+     2) API                 6) Modals / Forms
+     3) Utils               7) Photos (อัปโหลด/Lightbox)
+     4) Metrics (คำนวณ)     8) Actions & Init
+   เพิ่มหน้าจอใหม่ = เพิ่มรายการใน NAV + ฟังก์ชันใน VIEWS
+   ============================================================ */
+
+/* ---------------- 1) Config & State ---------------- */
+const NAV = [
+  { id: 'dashboard', label: 'ภาพรวม',     icon: 'dashboard' },
+  { id: 'sales',     label: 'สินค้าพร้อมขาย', short: 'พร้อมขาย', icon: 'tag' },
+  { id: 'units',     label: 'ห้อง / บ้าน', icon: 'building'  },
+  { id: 'timeline',  label: 'แผนงาน',     icon: 'calendar'  },
+  { id: 'settings',  label: 'ตั้งค่า',     icon: 'settings'  }
+];
+const STAGES = ['ก่อนปรับปรุง', 'ระหว่างดำเนินการ', 'หลังเสร็จ'];
+const UNIT_STATUS = {
+  notstarted: { label: 'ยังไม่เริ่ม',     tone: 'gray',   color: '#BFB4B5' },
+  progress:   { label: 'กำลังดำเนินการ', tone: 'blue',   color: '#4B7FD6' },
+  late:       { label: 'ล่าช้า',          tone: 'red',    color: '#C94747' },
+  ready:      { label: 'พร้อมส่งมอบ',    tone: 'green',  color: '#3E9A6C' },
+  handed:     { label: 'ส่งมอบแล้ว',     tone: 'purple', color: '#7A66B8' }
+};
+const TASK_STATUS = {
+  todo:  { label: 'รอดำเนินการ', tone: 'gray'  },
+  doing: { label: 'กำลังทำ',     tone: 'blue'  },
+  late:  { label: 'ล่าช้า',       tone: 'red'   },
+  done:  { label: 'เสร็จแล้ว',    tone: 'green' }
+};
+const PROJECT_COLORS = ['#E07A7A', '#E8A87C', '#8FB9A8', '#8AA9D6', '#B69BD1', '#D6A2B8', '#C9B27C'];
+const DEFAULT_UNIT_TYPES = ['คอนโด', 'อาคารพาณิชย์', 'บ้านแฝด', 'บ้านเดี่ยว', 'ทาวน์โฮม'];
+
+const S = {
+  data: { projects: [], units: [], tasks: [], photos: [], templates: [], meta: {} },
+  ver: 0,
+  view: 'dashboard',
+  params: {},
+  filters: { project: 'all', type: 'all', status: 'all', q: '' },
+  upload: null,
+  lb: null
+};
+
+/* ---------------- 2) API ---------------- */
+function api(action, payload) {
+  return new Promise((resolve, reject) => {
+    if (window.MockAPI) return window.MockAPI.call(action, payload).then(resolve, reject);
+    google.script.run
+      .withSuccessHandler(s => {
+        const r = typeof s === 'string' ? JSON.parse(s) : s;
+        r && r.ok ? resolve(r.data) : reject(new Error((r && r.error) || 'เกิดข้อผิดพลาด'));
+      })
+      .withFailureHandler(err => reject(err))
+      .api(action, payload || {});
+  });
+}
+
+/* ---------------- 3) Utils ---------------- */
+const $ = (sel, root = document) => root.querySelector(sel);
+const $$ = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const pad = n => String(n).padStart(2, '0');
+const toStr = d => d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+const todayStr = () => toStr(new Date());
+const parseD = s => { const p = String(s).split('-').map(Number); return new Date(p[0], p[1] - 1, p[2]); };
+const addDays = (s, n) => { const d = parseD(s); d.setDate(d.getDate() + n); return toStr(d); };
+const diffDays = (a, b) => Math.round((parseD(b) - parseD(a)) / 864e5);
+const TH_M = ['ม.ค.', 'ก.พ.', 'มี.ค.', 'เม.ย.', 'พ.ค.', 'มิ.ย.', 'ก.ค.', 'ส.ค.', 'ก.ย.', 'ต.ค.', 'พ.ย.', 'ธ.ค.'];
+const TH_MF = ['มกราคม', 'กุมภาพันธ์', 'มีนาคม', 'เมษายน', 'พฤษภาคม', 'มิถุนายน', 'กรกฎาคม', 'สิงหาคม', 'กันยายน', 'ตุลาคม', 'พฤศจิกายน', 'ธันวาคม'];
+function fmtD(s, withYear = true) {
+  if (!s) return '–';
+  const d = parseD(s);
+  return d.getDate() + ' ' + TH_M[d.getMonth()] + (withYear ? ' ' + String(d.getFullYear() + 543).slice(-2) : '');
+}
+function fmtDLong(s) { if (!s) return '–'; const d = parseD(s); return d.getDate() + ' ' + TH_MF[d.getMonth()] + ' ' + (d.getFullYear() + 543); }
+function relDays(s) {
+  if (!s) return '';
+  const n = diffDays(todayStr(), s);
+  if (n === 0) return 'วันนี้';
+  if (n === 1) return 'พรุ่งนี้';
+  if (n === -1) return 'เมื่อวาน';
+  return n > 0 ? 'อีก ' + n + ' วัน' : 'ผ่านมา ' + (-n) + ' วัน';
+}
+const toNum = v => { const n = Number(String(v == null ? '' : v).replace(/,/g, '')); return isFinite(n) ? n : 0; };
+const fmtBaht = n => { const v = toNum(n), d = Math.round(v * 100) % 100 ? 2 : 0; return v.toLocaleString('th-TH', { minimumFractionDigits: d, maximumFractionDigits: d }) + ' บาท'; };
+const fmtNum = n => (n === '' || n == null) ? '' : Number(n).toLocaleString('th-TH', { maximumFractionDigits: 2 });
+const byKey = k => (a, b) => (a[k] || '') < (b[k] || '') ? -1 : (a[k] || '') > (b[k] || '') ? 1 : 0;
+const bySeq = (a, b) => (Number(a.seq) || 0) - (Number(b.seq) || 0);
+const project = id => S.data.projects.find(p => p.id === id) || { name: '–', color: '#ccc' };
+const unitById = id => S.data.units.find(u => u.id === id);
+const taskById = id => S.data.tasks.find(t => t.id === id);
+const isCondo = u => u.unitType === 'คอนโด';
+const unitLabel = u => (isCondo(u) ? 'ห้อง ' : 'บ้านเลขที่ ') + u.unitNo;
+const unitLabelLong = u => (isCondo(u) ? 'ห้องชุดเลขที่ ' : 'บ้านเลขที่ ') + u.unitNo;
+const unitSubLine = u => [
+  isCondo(u) ? 'ห้องชุด' : u.unitType,
+  u.floor ? 'ชั้น ' + u.floor : '',
+  u.area ? fmtNum(u.area) + ' ตร.ม.' : '',
+  u.landArea ? fmtNum(u.landArea) + ' ตร.ว.' : ''
+].filter(Boolean).join(' · ');
+function unitTypes() {
+  const set = new Set((S.data.meta.unitTypes || DEFAULT_UNIT_TYPES));
+  S.data.units.forEach(u => u.unitType && set.add(u.unitType));
+  S.data.templates.forEach(t => t.unitType && set.add(t.unitType));
+  return Array.from(set);
+}
+function sortUnits(a, b) {
+  if (a.projectId !== b.projectId) {
+    const pa = S.data.projects.findIndex(p => p.id === a.projectId), pb = S.data.projects.findIndex(p => p.id === b.projectId);
+    return pa - pb;
+  }
+  return String(a.unitNo).localeCompare(String(b.unitNo), 'th', { numeric: true });
+}
+
+/* ---------------- Icons (Lucide-style) ---------------- */
+const ICONS = {
+  dashboard: '<rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/>',
+  building: '<rect x="4" y="2" width="16" height="20" rx="2"/><path d="M9 22v-4h6v4M8 6h.01M16 6h.01M12 6h.01M12 10h.01M12 14h.01M16 10h.01M16 14h.01M8 10h.01M8 14h.01"/>',
+  home: '<path d="M3 10.5 12 3l9 7.5V20a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/>',
+  calendar: '<rect x="3" y="4" width="18" height="18" rx="2"/><path d="M16 2v4M8 2v4M3 10h18"/>',
+  settings: '<path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  camera: '<path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3z"/><circle cx="12" cy="13" r="3"/>',
+  edit: '<path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z"/>',
+  trash: '<path d="M3 6h18M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>',
+  back: '<path d="m15 18-6-6 6-6"/>',
+  next: '<path d="m9 18 6-6-6-6"/>',
+  image: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  alert: '<path d="m21.7 18-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-3z"/><path d="M12 9v4M12 17h.01"/>',
+  search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+  x: '<path d="M18 6 6 18M6 6l12 12"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+  list: '<path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/>',
+  upload: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12"/>',
+  external: '<path d="M15 3h6v6M10 14 21 3M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>',
+  user: '<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+  layers: '<path d="m12 2 10 5-10 5L2 7z"/><path d="m2 17 10 5 10-5M2 12l10 5 10-5"/>',
+  refresh: '<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>',
+  key: '<circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/>',
+  flag: '<path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1zM4 22v-7"/>',
+  wrench: '<path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>',
+  sheet: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18M3 15h18M9 3v18"/>',
+  folder: '<path d="M4 20h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2z"/>',
+  trend: '<path d="m22 7-8.5 8.5-5-5L2 17"/><path d="M16 7h6v6"/>',
+  tag: '<path d="M12.6 2.6A2 2 0 0 0 11.2 2H4a2 2 0 0 0-2 2v7.2a2 2 0 0 0 .6 1.4l8.7 8.7a2.4 2.4 0 0 0 3.4 0l6.6-6.6a2.4 2.4 0 0 0 0-3.4z"/><circle cx="7.5" cy="7.5" r=".5" fill="currentColor"/>',
+  money: '<rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="12" cy="12" r="2.5"/><path d="M6 12h.01M18 12h.01"/>',
+  printer: '<path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/>',
+  download: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>',
+  info: '<circle cx="12" cy="12" r="10"/><path d="M12 16v-4M12 8h.01"/>'
+};
+function ic(name, size = 18, sw = 1.9) {
+  return '<svg class="ic" width="' + size + '" height="' + size + '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="' + sw + '" stroke-linecap="round" stroke-linejoin="round">' + (ICONS[name] || '') + '</svg>';
+}
+const chip = (label, tone = '', dot = false) => '<span class="chip ' + tone + '">' + (dot ? '<i class="dot"></i>' : '') + esc(label) + '</span>';
+const statusChip = st => chip(UNIT_STATUS[st].label, UNIT_STATUS[st].tone, true);
+const taskChip = st => chip(TASK_STATUS[st].label, TASK_STATUS[st].tone, true);
+function pbar(p, tone = '', lg = false) {
+  return '<div class="pbar ' + tone + (lg ? ' lg' : '') + '"><span style="width:' + Math.max(0, Math.min(100, p)) + '%"></span></div>';
+}
+function progLine(p, tone = '') { return '<div class="prog-line">' + pbar(p, tone) + '<b class="num">' + p + '%</b></div>'; }
+function ring(p, size = 56, stroke = 6, color = 'var(--primary)') {
+  const r = (size - stroke) / 2, c = 2 * Math.PI * r, off = c * (1 - p / 100);
+  return '<div class="ring" style="width:' + size + 'px;height:' + size + 'px"><svg width="' + size + '" height="' + size + '">' +
+    '<circle cx="' + size / 2 + '" cy="' + size / 2 + '" r="' + r + '" fill="none" stroke="var(--primary-100)" stroke-width="' + stroke + '"/>' +
+    '<circle cx="' + size / 2 + '" cy="' + size / 2 + '" r="' + r + '" fill="none" stroke="' + color + '" stroke-width="' + stroke + '" stroke-linecap="round" stroke-dasharray="' + c + '" stroke-dashoffset="' + off + '"/>' +
+    '</svg><span class="ring-label" style="font-size:' + Math.round(size / 4.2) + 'px">' + p + '%</span></div>';
+}
+function toneForUnit(st) { return st === 'ready' ? 'green' : st === 'late' ? 'red' : st === 'handed' ? 'purple' : ''; }
+
+/* ---------------- 4) Metrics ---------------- */
+function taskState(t) {
+  const p = Number(t.progress) || 0;
+  if (p >= 100) return 'done';
+  if (t.dueDate && t.dueDate < todayStr()) return 'late';
+  if (p > 0 || (t.startDate && t.startDate <= todayStr())) return 'doing';
+  return 'todo';
+}
+function taskDays(t) { return t.startDate && t.dueDate ? Math.max(1, diffDays(t.startDate, t.dueDate) + 1) : 1; }
+const tasksOf = uid => S.data.tasks.filter(t => t.unitId === uid).sort(bySeq);
+const photosOf = uid => S.data.photos.filter(p => p.unitId === uid);
+
+let _mc = { ver: -1, map: new Map() };
+function M(u) {
+  if (_mc.ver !== S.ver) _mc = { ver: S.ver, map: new Map() };
+  if (!_mc.map.has(u.id)) _mc.map.set(u.id, computeUnit(u));
+  return _mc.map.get(u.id);
+}
+function computeUnit(u) {
+  const today = todayStr();
+  const tasks = tasksOf(u.id);
+  let wSum = 0, pSum = 0, done = 0, overdue = 0, forecast = '', start = '';
+  tasks.forEach(t => {
+    const w = taskDays(t), p = Number(t.progress) || 0, st = taskState(t);
+    wSum += w; pSum += w * p;
+    if (st === 'done') done++;
+    if (st === 'late') overdue++;
+    let end = st === 'done' ? (t.finishDate || t.dueDate) : t.dueDate;
+    if (st !== 'done' && end && end < today) end = today;     // งานค้าง → เลื่อนอย่างน้อยถึงวันนี้
+    if (end && end > forecast) forecast = end;
+    if (t.startDate && (!start || t.startDate < start)) start = t.startDate;
+  });
+  const progress = wSum ? Math.round(pSum / wSum) : 0;
+  let status;
+  if (u.handoverDate) status = 'handed';
+  else if (tasks.length && done === tasks.length) status = 'ready';
+  else if (overdue > 0 || (u.plannedHandover && forecast && forecast > u.plannedHandover)) status = 'late';
+  else if (progress === 0 && (!start || start > today)) status = 'notstarted';
+  else status = 'progress';
+  const current = tasks.find(t => taskState(t) !== 'done') || null;
+  // ประมาณการค่าก่อสร้าง: รวมค่าใช้จ่ายรายงาน ถ้ายังไม่กรอกรายงานใช้ "งบประมาณรวม" ของยูนิต
+  const taskCost = tasks.reduce((s, t) => s + toNum(t.estCost), 0);
+  const earned = tasks.reduce((s, t) => s + toNum(t.estCost) * (Number(t.progress) || 0) / 100, 0);
+  const costTasks = tasks.filter(t => toNum(t.estCost) > 0).length;
+  const budget = toNum(u.budget);
+  const cost = taskCost > 0 ? taskCost : budget;
+  const costSource = taskCost > 0 ? 'tasks' : budget > 0 ? 'budget' : '';
+  const planEnd = tasks.reduce((mx, t) => t.dueDate && t.dueDate > mx ? t.dueDate : mx, '');   // วันเสร็จตามแผนงานก่อสร้าง
+  const started = !!start && (start <= today || progress > 0);
+  const slip = u.plannedHandover && forecast ? diffDays(u.plannedHandover, forecast) : null;
+  const photos = photosOf(u.id);
+  const before = photos.filter(p => p.stage === STAGES[0]);
+  return { tasks, total: tasks.length, done, overdue, progress, forecast, start, planEnd, started, cost, costSource, taskCost, costTasks, budget, earned, status, current, slip, photos, before, cover: before[0] || photos[0] || null };
+}
+function unitsInScope(pid) { return S.data.units.filter(u => pid === 'all' || u.projectId === pid).sort(sortUnits); }
+function filteredUnits() {
+  const f = S.filters, q = f.q.trim().toLowerCase();
+  return unitsInScope(f.project).filter(u => {
+    if (f.type !== 'all' && u.unitType !== f.type) return false;
+    if (f.status !== 'all' && M(u).status !== f.status) return false;
+    if (q) {
+      const hay = [u.unitNo, u.unitType, u.customer, u.note, project(u.projectId).name, 'ชั้น ' + u.floor].join(' ').toLowerCase();
+      if (hay.indexOf(q) < 0) return false;
+    }
+    return true;
+  });
+}
+
+/* ---------------- 5) Views ---------------- */
+const VIEWS = {};
+const AFTER = {};
+
+function render() {
+  const v = $('#view');
+  v.innerHTML = (VIEWS[S.view] || VIEWS.dashboard)();
+  if (AFTER[S.view]) AFTER[S.view]();
+}
+function go(view, params = {}) {
+  S.view = view; S.params = params;
+  renderNav(); render();
+  window.scrollTo({ top: 0 });
+}
+function renderNav() {
+  const late = S.data.units.filter(u => M(u).status === 'late').length;
+  const html = (mobile) => NAV.map(n => '<button class="nav-item ' + (S.view === n.id || (n.id === 'units' && S.view === 'unit') ? 'active' : '') + '" data-act="nav" data-view="' + n.id + '">' +
+    ic(n.icon, 20) + '<span>' + (mobile && n.short ? n.short : n.label) + '</span>' + (n.id === 'units' && late ? '<span class="count">' + late + '</span>' : '') + '</button>').join('');
+  $('#side-nav').innerHTML = html(false);
+  $('#bottom-nav').innerHTML = html(true);
+}
+function projectSelect(id, value, withAll = true) {
+  return '<select class="select inline" id="' + id + '">' + (withAll ? '<option value="all">ทุกโครงการ</option>' : '') +
+    S.data.projects.map(p => '<option value="' + p.id + '"' + (value === p.id ? ' selected' : '') + '>' + esc(p.name) + '</option>').join('') + '</select>';
+}
+
+/* ===== Dashboard ===== */
+VIEWS.dashboard = () => {
+  const pid = S.filters.project;
+  const units = unitsInScope(pid);
+  const ms = units.map(u => ({ u, m: M(u) }));
+  const cnt = k => ms.filter(x => x.m.status === k).length;
+  const avg = ms.length ? Math.round(ms.reduce((s, x) => s + x.m.progress, 0) / ms.length) : 0;
+  const uids = new Set(units.map(u => u.id));
+  const tasks = S.data.tasks.filter(t => uids.has(t.unitId));
+  const today = todayStr();
+  const lateTasks = tasks.filter(t => taskState(t) === 'late').sort(byKey('dueDate'));
+  const soonTasks = tasks.filter(t => { const st = taskState(t); return (st === 'doing' || st === 'todo') && t.dueDate && diffDays(today, t.dueDate) <= 7 && t.dueDate >= today; }).sort(byKey('dueDate'));
+  const projs = S.data.projects.filter(p => pid === 'all' || p.id === pid);
+  const upcoming = ms.filter(x => x.m.status !== 'handed' && x.m.status !== 'ready' && x.m.forecast).sort((a, b) => a.m.forecast < b.m.forecast ? -1 : 1);
+
+  const kpi = (tone, icon, label, val, sub, status) =>
+    '<div class="kpi tone-' + tone + (status ? ' clickable' : '') + '"' + (status ? ' data-act="goto-status" data-status="' + status + '"' : '') + '>' +
+    '<div class="kpi-top"><span>' + label + '</span><span class="kpi-icon">' + ic(icon, 18) + '</span></div>' +
+    '<div class="kpi-val num">' + val + '</div><div class="kpi-sub">' + sub + '</div></div>';
+
+  return '' +
+  '<div class="page-head"><div><h1>ภาพรวมแผนส่งมอบ</h1><div class="sub">ข้อมูล ณ ' + fmtDLong(today) + '</div></div>' +
+  '<div class="head-actions">' + projectSelect('dash-project', pid) + '<button class="btn" data-act="refresh">' + ic('refresh', 16) + 'รีเฟรช</button></div></div>' +
+
+  '<div class="kpis">' +
+    kpi('primary', 'building', 'ห้อง/บ้านทั้งหมด', units.length + '<small>ยูนิต</small>', projs.length + ' โครงการ · ' + tasks.length + ' งาน', 'all') +
+    kpi('green', 'key', 'พร้อมส่งมอบ', cnt('ready') + '<small>ยูนิต</small>', 'ส่งมอบแล้ว ' + cnt('handed') + ' ยูนิต', 'ready') +
+    kpi('blue', 'wrench', 'กำลังดำเนินการ', cnt('progress') + '<small>ยูนิต</small>', 'ยังไม่เริ่ม ' + cnt('notstarted') + ' ยูนิต', 'progress') +
+    kpi('red', 'alert', 'ล่าช้า', cnt('late') + '<small>ยูนิต</small>', lateTasks.length + ' งานเลยกำหนด', 'late') +
+    kpi('purple', 'trend', 'ความคืบหน้าเฉลี่ย', avg + '<small>%</small>', pbar(avg), '') +
+  '</div>' +
+
+  '<div class="grid-2" style="margin-bottom:18px">' +
+    '<section class="card"><div class="card-head"><h3>' + ic('building', 18) + 'ความคืบหน้าแต่ละโครงการ</h3></div>' +
+      (projs.length ? projs.map(p => projectRow(p)).join('') : '<div class="empty">ยังไม่มีโครงการ</div>') + '</section>' +
+    '<section class="card"><div class="card-head"><h3>' + ic('dashboard', 18) + 'สถานะห้อง/บ้าน</h3></div>' + statusDonut(ms) +
+      (upcoming[0] ? '<div class="next-box" data-act="open-unit" data-id="' + upcoming[0].u.id + '">' + ic('flag', 18) +
+        '<div>ยูนิตถัดไปที่จะพร้อมส่งมอบ: <b>' + esc(unitLabel(upcoming[0].u)) + '</b> <span class="muted">(' + esc(project(upcoming[0].u.projectId).name) + ')</span><br>คาดว่า <b>' + fmtD(upcoming[0].m.forecast) + '</b> · ' + relDays(upcoming[0].m.forecast) + '</div></div>' : '') +
+    '</section>' +
+  '</div>' +
+
+  '<section class="card" style="margin-bottom:18px"><div class="card-head"><h3>' + ic('calendar', 18) + 'กำหนดพร้อมส่งมอบรายยูนิต <span class="hint">เรียงตามวันที่คาดว่าพร้อม</span></h3>' +
+    '<button class="btn sm ghost" data-act="nav" data-view="timeline">ดูแผนงาน ' + ic('next', 14) + '</button></div>' + handoverTable(ms) + '</section>' +
+
+  '<div class="grid-2 even" style="margin-bottom:18px">' +
+    '<section class="card"><div class="card-head"><h3>' + ic('alert', 18) + 'งานล่าช้า</h3>' + chip(lateTasks.length + ' งาน', lateTasks.length ? 'red' : 'green') + '</div>' + taskList(lateTasks, 'late') + '</section>' +
+    '<section class="card"><div class="card-head"><h3>' + ic('clock', 18) + 'ครบกำหนดใน 7 วัน</h3>' + chip(soonTasks.length + ' งาน', 'amber') + '</div>' + taskList(soonTasks, 'soon') + '</section>' +
+  '</div>' +
+
+  '<section class="card"><div class="card-head"><h3>' + ic('layers', 18) + 'ความคืบหน้าตามหมวดงาน</h3><span class="hint">เฉลี่ยทุกยูนิตในมุมมองนี้</span></div>' + categoryBars(tasks) + '</section>';
+};
+
+function projectRow(p) {
+  const units = S.data.units.filter(u => u.projectId === p.id);
+  const ms = units.map(M);
+  const avg = ms.length ? Math.round(ms.reduce((s, m) => s + m.progress, 0) / ms.length) : 0;
+  const pCost = ms.reduce((s, m) => s + m.cost, 0);
+  const last = ms.filter(m => m.status !== 'handed').map(m => m.forecast).filter(Boolean).sort().pop();
+  const types = {};
+  units.forEach(u => types[u.unitType] = (types[u.unitType] || 0) + 1);
+  const counts = Object.keys(UNIT_STATUS).map(k => [k, ms.filter(m => m.status === k).length]).filter(x => x[1]);
+  return '<div class="proj-row" data-act="goto-project" data-id="' + p.id + '">' +
+    '<div class="proj-row-top"><span class="proj-dot" style="background:' + esc(p.color || PROJECT_COLORS[0]) + '"></span><b>' + esc(p.name) + '</b>' +
+    '<span class="muted small">' + Object.keys(types).map(t => esc(t) + ' ' + types[t]).join(' · ') + '</span>' +
+    '<span class="right">' + (last ? 'พร้อมครบทั้งโครงการ ~ <b style="color:var(--text)">' + fmtD(last) + '</b>' : '') + '</span></div>' +
+    progLine(avg) +
+    '<div class="proj-row-stats">' + (pCost ? '<span class="chip outline">' + ic('money', 12) + 'ค่าก่อสร้างรวม ' + fmtBaht(pCost) + '</span>' : '') + counts.map(([k, n]) => chip(UNIT_STATUS[k].label + ' ' + n, UNIT_STATUS[k].tone)).join('') + '</div></div>';
+}
+
+function statusDonut(ms) {
+  const total = ms.length || 1, size = 150, stroke = 22, r = (size - stroke) / 2, c = 2 * Math.PI * r;
+  let off = 0, arcs = '';
+  Object.keys(UNIT_STATUS).forEach(k => {
+    const n = ms.filter(x => x.m.status === k).length;
+    if (!n) return;
+    const len = c * n / total;
+    arcs += '<circle cx="' + size / 2 + '" cy="' + size / 2 + '" r="' + r + '" fill="none" stroke="' + UNIT_STATUS[k].color + '" stroke-width="' + stroke + '" stroke-dasharray="' + (len - 2) + ' ' + (c - len + 2) + '" stroke-dashoffset="' + (-off) + '"/>';
+    off += len;
+  });
+  const legend = Object.keys(UNIT_STATUS).map(k => {
+    const n = ms.filter(x => x.m.status === k).length;
+    return '<div class="legend-item" data-act="goto-status" data-status="' + k + '"><i style="background:' + UNIT_STATUS[k].color + '"></i>' + UNIT_STATUS[k].label + '<b class="num">' + n + '</b></div>';
+  }).join('');
+  return '<div class="donut-wrap"><div class="ring" style="width:' + size + 'px;height:' + size + 'px"><svg width="' + size + '" height="' + size + '">' +
+    '<circle cx="' + size / 2 + '" cy="' + size / 2 + '" r="' + r + '" fill="none" stroke="var(--primary-50)" stroke-width="' + stroke + '"/>' + arcs +
+    '</svg><span class="ring-label" style="text-align:center;line-height:1.2"><span style="font-size:26px">' + ms.length + '</span><br><span class="muted small" style="font-weight:400">ยูนิต</span></span></div>' +
+    '<div class="legend">' + legend + '</div></div>';
+}
+
+function handoverTable(ms) {
+  if (!ms.length) return '<div class="empty">ยังไม่มีห้อง/บ้าน</div>';
+  const rows = ms.slice().sort((a, b) => {
+    const fa = a.m.status === 'handed' ? 'z' + a.u.handoverDate : (a.m.forecast || 'y');
+    const fb = b.m.status === 'handed' ? 'z' + b.u.handoverDate : (b.m.forecast || 'y');
+    return fa < fb ? -1 : fa > fb ? 1 : 0;
+  });
+  return '<div class="table-wrap"><table class="tbl"><thead><tr>' +
+    '<th>ห้อง / บ้าน</th><th>โครงการ</th><th>งานปัจจุบัน</th><th style="width:170px">ความคืบหน้า</th><th>คาดว่าพร้อม</th><th>กำหนดส่งมอบ</th><th>สถานะ</th></tr></thead><tbody>' +
+    rows.map(({ u, m }) => {
+      let slip = '';
+      if (m.status === 'handed') slip = '<div class="slip ok">ส่งมอบ ' + fmtD(u.handoverDate) + '</div>';
+      else if (m.slip != null) slip = m.slip > 0 ? '<div class="slip late">ช้ากว่ากำหนด ' + m.slip + ' วัน</div>' : '<div class="slip ok">ทันกำหนด' + (m.slip < 0 ? ' (เผื่อ ' + (-m.slip) + ' วัน)' : '') + '</div>';
+      return '<tr data-act="open-unit" data-id="' + u.id + '">' +
+        '<td class="u-name"><b>' + esc(unitLabel(u)) + '</b><div>' + esc(unitSubLine(u)) + '</div></td>' +
+        '<td class="nowrap"><span class="proj-dot" style="display:inline-block;background:' + esc(project(u.projectId).color) + ';margin-right:6px;vertical-align:middle;width:8px;height:8px"></span>' + esc(project(u.projectId).name) + '</td>' +
+        '<td>' + (m.current ? '<div style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + esc(m.current.title) + '</div><div class="muted small">' + (m.total ? m.done + '/' + m.total + ' งาน' : '') + '</div>' : (m.total ? '<span class="muted">งานครบแล้ว</span>' : '<span class="muted">ยังไม่มีงาน</span>')) + '</td>' +
+        '<td>' + progLine(m.progress, toneForUnit(m.status)) + '</td>' +
+        '<td class="nowrap"><b style="font-weight:500">' + fmtD(m.forecast) + '</b><div class="muted small">' + (m.status === 'handed' ? '' : relDays(m.forecast)) + '</div></td>' +
+        '<td class="nowrap">' + fmtD(u.plannedHandover) + slip + '</td>' +
+        '<td>' + statusChip(m.status) + '</td></tr>';
+    }).join('') + '</tbody></table></div>';
+}
+
+function taskList(tasks, kind) {
+  if (!tasks.length) return '<div class="empty">' + ic(kind === 'late' ? 'check' : 'calendar', 28) + '<div>' + (kind === 'late' ? 'ไม่มีงานล่าช้า เยี่ยมมาก!' : 'ไม่มีงานครบกำหนดในสัปดาห์นี้') + '</div></div>';
+  const today = todayStr();
+  return '<div class="list">' + tasks.slice(0, 8).map(t => {
+    const u = unitById(t.unitId); if (!u) return '';
+    const d = diffDays(today, t.dueDate);
+    const badge = kind === 'late'
+      ? '<div class="li-badge red"><b>' + (-d) + '</b>วันช้า</div>'
+      : '<div class="li-badge amber"><b>' + (d === 0 ? '0' : d) + '</b>' + (d === 0 ? 'วันนี้' : 'วัน') + '</div>';
+    return '<div class="list-item" data-act="open-task" data-id="' + t.id + '">' + badge +
+      '<div class="li-main"><div class="li-title">' + esc(t.title) + '</div><div class="li-sub">' + esc(unitLabel(u)) + ' · ' + esc(project(u.projectId).name) + ' · กำหนด ' + fmtD(t.dueDate) + '</div></div>' +
+      '<div style="width:90px">' + progLine(Number(t.progress) || 0, kind === 'late' ? 'red' : '') + '</div></div>';
+  }).join('') + (tasks.length > 8 ? '<div class="muted small" style="padding-top:10px">และอีก ' + (tasks.length - 8) + ' งาน</div>' : '') + '</div>';
+}
+
+function categoryBars(tasks) {
+  if (!tasks.length) return '<div class="empty">ยังไม่มีงาน</div>';
+  const g = {};
+  tasks.forEach(t => { const k = t.category || 'อื่น ๆ'; (g[k] = g[k] || { n: 0, w: 0, p: 0, done: 0 }); const w = taskDays(t); g[k].n++; g[k].w += w; g[k].p += w * (Number(t.progress) || 0); if (Number(t.progress) >= 100) g[k].done++; });
+  return '<div>' + Object.keys(g).map(k => {
+    const p = Math.round(g[k].p / g[k].w);
+    return '<div class="cat-row"><div>' + esc(k) + '<div class="muted">' + g[k].done + '/' + g[k].n + ' งานเสร็จ</div></div>' + pbar(p, p >= 100 ? 'green' : '') + '<b class="num" style="text-align:right;font-weight:500">' + p + '%</b></div>';
+  }).join('') + '</div>';
+}
+
+
+/* ===== สินค้าพร้อมขาย ===== */
+const SALES_TYPES = ['คอนโด', 'บ้านแฝด', 'บ้านเดี่ยว', 'อาคารพาณิชย์'];   // ลำดับการแสดงผล (ประเภทอื่นจะต่อท้าย)
+const SALES_SECTIONS = [
+  { id: 'ready', no: 1, title: 'พร้อมส่งมอบ',              tone: 'green', icon: 'key',      desc: 'งานซ่อม/ปรับปรุงครบ 100% ส่งมอบลูกค้าได้ทันที' },
+  { id: 'soon',  no: 2, title: 'เสร็จภายในเดือนถัดไป',       tone: 'amber', icon: 'flag',     desc: '' },
+  { id: 'build', no: 3, title: 'อยู่ระหว่างก่อสร้าง',         tone: 'blue',  icon: 'wrench',   desc: 'เริ่มงานแล้ว เสร็จหลังเดือนถัดไป (ไม่นับยูนิตที่ยังไม่เริ่ม)' }
+];
+function salesCutoff() {                     // วันสุดท้ายของเดือนถัดไป เช่น วันนี้ 27 ก.ย. → นับถึง 31 ต.ค. (วันสิ้นเดือนตามปฏิทินจริง)
+  const d = new Date();
+  return toStr(new Date(d.getFullYear(), d.getMonth() + 2, 0));
+}
+function salesBuckets() {
+  const f = S.filters, cutoff = salesCutoff();
+  const out = { ready: [], soon: [], build: [], skipped: 0 };
+  unitsInScope(f.project).forEach(u => {
+    if (f.salesFree && u.customer) return;
+    const m = M(u);
+    if (m.status === 'handed') return;                                  // ส่งมอบลูกค้าไปแล้ว → ไม่ใช่สินค้าคงเหลือ
+    if (m.status === 'ready') return out.ready.push({ u, m, date: m.forecast });
+    if (!m.planEnd) { out.skipped++; return; }                          // ยังไม่มีแผนงาน
+    if (m.planEnd <= cutoff) return out.soon.push({ u, m, date: m.planEnd });
+    if (m.started) return out.build.push({ u, m, date: m.planEnd });
+    out.skipped++;                                                      // ยังไม่เริ่มดำเนินการ → ไม่นับ
+  });
+  const byDate = (a, b) => (a.date || '') < (b.date || '') ? -1 : (a.date || '') > (b.date || '') ? 1 : sortUnits(a.u, b.u);
+  out.ready.sort(byDate); out.soon.sort(byDate); out.build.sort(byDate);
+  return out;
+}
+function salesTypeOrder(list) {
+  const extra = Array.from(new Set(list.map(x => x.u.unitType))).filter(t => SALES_TYPES.indexOf(t) < 0);
+  return SALES_TYPES.concat(extra);
+}
+VIEWS.sales = () => {
+  const f = S.filters, cutoff = salesCutoff(), today = todayStr();
+  f.salesType = f.salesType || 'all';
+  const B = salesBuckets();
+  const all = B.ready.concat(B.soon, B.build);
+  const types = salesTypeOrder(all);
+  const n = (sec, t) => B[sec].filter(x => t === 'all' || x.u.unitType === t).length;
+  const sumArea = list => list.reduce((s, x) => s + (Number(x.u.area) || 0), 0);
+
+  const summary = '<section class="card" style="margin-bottom:18px"><div class="card-head"><h3>' + ic('dashboard', 18) + 'สรุปจำนวนแยกตามประเภทสินค้า</h3><span class="hint">คลิกตัวเลขเพื่อกรอง</span></div>' +
+    '<div class="table-wrap"><table class="tbl sales-sum" style="min-width:560px"><thead><tr><th>ประเภทสินค้า</th>' +
+    SALES_SECTIONS.map(s => '<th class="c"><span class="chip ' + s.tone + '">' + s.no + '. ' + s.title + '</span></th>').join('') + '<th class="c">รวม</th></tr></thead><tbody>' +
+    types.map(t => {
+      const tot = n('ready', t) + n('soon', t) + n('build', t);
+      return '<tr data-act="sales-type" data-type="' + esc(t) + '" class="' + (f.salesType === t ? 'on' : '') + '"><td><b style="font-weight:500">' + esc(t) + '</b></td>' +
+        SALES_SECTIONS.map(s => '<td class="c num"><span class="sum-n ' + (n(s.id, t) ? s.tone : 'zero') + '">' + n(s.id, t) + '</span></td>').join('') +
+        '<td class="c num"><b>' + tot + '</b></td></tr>';
+    }).join('') +
+    '</tbody><tfoot><tr><td>รวมทั้งหมด</td>' + SALES_SECTIONS.map(s => '<td class="c num">' + B[s.id].length + '</td>').join('') + '<td class="c num">' + all.length + '</td></tr></tfoot></table></div></section>';
+
+  const column = sec => {
+    const list = B[sec.id].filter(x => f.salesType === 'all' || x.u.unitType === f.salesType);
+    const desc = sec.id === 'soon' ? 'ตามแผนงานก่อสร้าง ตั้งแต่วันนี้ ถึง <b>' + fmtD(cutoff) + '</b> · เรียงจากเสร็จก่อน' : sec.desc + (sec.id === 'build' ? ' · เรียงจากเสร็จก่อน' : '');
+    const groups = salesTypeOrder(list).filter(t => f.salesType === 'all' || t === f.salesType).map(t => {
+      const items = list.filter(x => x.u.unitType === t);
+      if (!items.length && SALES_TYPES.indexOf(t) < 0) return '';
+      return '<div class="sale-group"><div class="sale-group-head">' + ic(t === 'คอนโด' ? 'building' : 'home', 15) + '<b>' + esc(t) + '</b><span class="muted small">' + items.length + ' ยูนิต</span></div>' +
+        (items.length ? items.map(x => saleItem(x, sec.id)).join('') : '<div class="sale-empty">–</div>') + '</div>';
+    }).join('');
+    return '<section class="sale-col tone-' + sec.tone + '"><div class="sale-col-head"><div class="sale-no">' + sec.no + '</div><div class="grow"><h3>' + sec.title + '</h3><div class="small muted">' + desc + '</div></div>' +
+      '<div class="sale-count"><b class="num">' + list.length + '</b><span>ยูนิต</span></div></div>' +
+      (sumArea(list) ? '<div class="sale-col-sub">พื้นที่รวม ' + fmtNum(sumArea(list)) + ' ตร.ม.</div>' : '') +
+      '<div class="sale-col-body">' + groups + '</div></section>';
+  };
+
+  return '<div class="page-head"><div><h1>สินค้าพร้อมขาย</h1><div class="sub">สรุปห้อง/บ้านที่พร้อมขาย และที่กำลังจะพร้อม ณ ' + fmtDLong(today) + '</div></div>' +
+    '<div class="head-actions">' + projectSelect('sales-project', f.project) +
+    '<label class="check-line fchip" style="padding:7px 14px"><input type="checkbox" id="sales-free"' + (f.salesFree ? ' checked' : '') + '> เฉพาะยูนิตที่ยังไม่มีลูกค้า</label></div></div>' +
+    '<div class="status-chips">' + ['all'].concat(types).map(t => '<button class="fchip ' + (f.salesType === t ? 'on' : '') + '" data-act="sales-type" data-type="' + esc(t) + '">' + (t === 'all' ? 'ทุกประเภท' : esc(t)) +
+      '<span class="n">' + (n('ready', t) + n('soon', t) + n('build', t)) + '</span></button>').join('') + '</div>' +
+    summary +
+    '<div class="sale-cols">' + SALES_SECTIONS.map(column).join('') + '</div>' +
+    (B.skipped ? '<div class="muted small" style="margin-top:12px">' + ic('info', 14) + ' ไม่นับ ' + B.skipped + ' ยูนิตที่ยังไม่เริ่มดำเนินการ / ยังไม่มีแผนงาน</div>' : '');
+};
+function saleItem(x, sec) {
+  const { u, m } = x, today = todayStr();
+  const d = x.date ? diffDays(today, x.date) : null;
+  let when;
+  if (sec === 'ready') when = '<b>พร้อมแล้ว</b><small>' + (x.date ? 'เสร็จ ' + fmtD(x.date) : '') + '</small>';
+  else when = '<b>' + fmtD(x.date) + '</b><small class="' + (d < 0 ? 'slip late' : '') + '">' + (d < 0 ? 'เลยแผน ' + (-d) + ' วัน' : relDays(x.date)) + '</small>';
+  const late = sec !== 'ready' && m.forecast && m.forecast > x.date ? '<span class="chip red">คาดเสร็จจริง ' + fmtD(m.forecast) + '</span>' : '';
+  const notStarted = sec === 'soon' && !m.started ? chip('ยังไม่เริ่ม', 'gray') : '';
+  return '<div class="sale-item" data-act="open-unit" data-id="' + u.id + '">' +
+    '<div class="si-top"><div class="si-name"><b>' + esc(unitLabel(u)) + '</b><span class="muted small">' + esc(project(u.projectId).name) + '</span></div><div class="si-date">' + when + '</div></div>' +
+    '<div class="si-meta">' + esc(unitSubLine(u).split(' · ').slice(1).join(' · ') || '–') + (u.customer ? ' · <span style="color:var(--primary-700)">ลูกค้า: ' + esc(u.customer) + '</span>' : '') + '</div>' +
+    (sec !== 'ready' ? progLine(m.progress, m.status === 'late' ? 'red' : '') : '') +
+    (late || notStarted ? '<div class="si-tags">' + notStarted + late + '</div>' : '') + '</div>';
+}
+AFTER.sales = () => {
+  $('#sales-project').onchange = e => { S.filters.project = e.target.value; render(); };
+  $('#sales-free').onchange = e => { S.filters.salesFree = e.target.checked; render(); };
+};
+
+AFTER.dashboard = () => {
+  const sel = $('#dash-project');
+  if (sel) sel.onchange = () => { S.filters.project = sel.value; render(); };
+};
+
+/* ===== Units list ===== */
+VIEWS.units = () => {
+  const f = S.filters;
+  const scope = unitsInScope(f.project).filter(u => f.type === 'all' || u.unitType === f.type);
+  const count = k => k === 'all' ? scope.length : scope.filter(u => M(u).status === k).length;
+  const types = Array.from(new Set(S.data.units.map(u => u.unitType)));
+  return '<div class="page-head"><div><h1>ห้อง / บ้านทั้งหมด</h1><div class="sub">คลิกที่การ์ดเพื่อดูงานซ่อม รูปภาพ และแผนส่งมอบ</div></div>' +
+    '<div class="head-actions"><button class="btn primary" data-act="new-unit">' + ic('plus', 16) + 'เพิ่มห้อง/บ้าน</button></div></div>' +
+    '<div class="filter-bar">' +
+      '<div class="search-box">' + ic('search', 16) + '<input class="input" id="unit-q" placeholder="ค้นหาเลขที่ห้อง/บ้าน, ลูกค้า…" value="' + esc(f.q) + '"></div>' +
+      projectSelect('unit-project', f.project) +
+      '<select class="select inline" id="unit-type"><option value="all">ทุกประเภท</option>' + types.map(t => '<option' + (f.type === t ? ' selected' : '') + '>' + esc(t) + '</option>').join('') + '</select>' +
+    '</div>' +
+    '<div class="status-chips">' + ['all'].concat(Object.keys(UNIT_STATUS)).map(k =>
+      '<button class="fchip ' + (f.status === k ? 'on' : '') + '" data-act="filter-status" data-status="' + k + '">' + (k === 'all' ? 'ทั้งหมด' : UNIT_STATUS[k].label) + '<span class="n">' + count(k) + '</span></button>').join('') + '</div>' +
+    '<div id="unit-results">' + unitResults() + '</div>';
+};
+function unitResults() {
+  const list = filteredUnits();
+  if (!S.data.projects.length) return '<div class="card empty big">' + ic('building', 40) + '<h3>ยังไม่มีโครงการ</h3><div>เริ่มต้นโดยสร้างโครงการที่หน้า “ตั้งค่า”</div><div style="margin-top:14px"><button class="btn primary" data-act="new-project">' + ic('plus', 16) + 'สร้างโครงการ</button></div></div>';
+  if (!list.length) return '<div class="card empty big">' + ic('search', 36) + '<h3>ไม่พบห้อง/บ้านตามเงื่อนไข</h3><div>ลองเปลี่ยนตัวกรองหรือคำค้นหา</div></div>';
+  const groups = {};
+  list.forEach(u => (groups[u.projectId] = groups[u.projectId] || []).push(u));
+  return S.data.projects.filter(p => groups[p.id]).map(p => {
+    const us = groups[p.id];
+    const all = S.data.units.filter(u => u.projectId === p.id).map(M);
+    const avg = all.length ? Math.round(all.reduce((s, m) => s + m.progress, 0) / all.length) : 0;
+    return '<section class="proj-group"><div class="proj-group-head"><span class="proj-dot" style="background:' + esc(p.color) + '"></span><h2>' + esc(p.name) + '</h2>' +
+      '<span class="muted small">' + us.length + ' ยูนิต</span><div class="prog-line" style="width:200px">' + pbar(avg) + '<b class="num">' + avg + '%</b></div></div>' +
+      '<div class="unit-grid">' + us.map(unitCard).join('') +
+      '<div class="add-card" data-act="new-unit" data-project="' + p.id + '"><div>' + ic('plus', 28) + '<div>เพิ่มห้อง/บ้าน</div></div></div></div></section>';
+  }).join('');
+}
+function unitCard(u) {
+  const m = M(u);
+  // หัวการ์ด: สีพื้นตามสถานะ + เลขที่ห้อง/บ้าน (รูปปกแสดงเป็นภาพย่อด้านขวา เพื่อไม่ให้ตัวอักษรจม)
+  const art = m.cover
+    ? '<span class="uc-thumb"><img loading="lazy" src="' + esc(m.cover.thumb || m.cover.url) + '" alt=""></span>'
+    : '<span class="uc-mark">' + ic(isCondo(u) ? 'building' : 'home', 64, 1.3) + '</span>';
+  const foot = m.status === 'handed'
+    ? '<span class="muted">ส่งมอบแล้ว</span><b>' + fmtD(u.handoverDate) + '</b>'
+    : '<span class="muted">คาดว่าพร้อม</span><b>' + fmtD(m.forecast) + (m.slip > 0 ? ' <span class="slip late">+' + m.slip + 'ว.</span>' : '') + '</b>';
+  return '<article class="unit-card" data-act="open-unit" data-id="' + u.id + '">' +
+    '<div class="uc-cover st-' + m.status + '">' + art +
+      '<div class="uc-cover-top">' + statusChip(m.status) + (m.photos.length ? '<span class="pcount">' + ic('camera', 12) + m.photos.length + '</span>' : '') + '</div>' +
+      '<div class="uc-cover-title"><div class="uc-no">' + esc(u.unitNo) + '</div><div class="uc-type">' + esc(isCondo(u) ? 'ห้องชุด' : u.unitType) + '</div></div>' +
+    '</div>' +
+    '<div class="uc-body">' +
+    '<div class="uc-meta">' + esc(unitSubLine(u).split(' · ').slice(1).join(' · ') || '–') + (u.customer ? ' · ' + esc(u.customer) : '') + '</div>' +
+    progLine(m.progress, toneForUnit(m.status)) +
+    '<div class="uc-cost" title="' + (m.costSource === 'tasks' ? 'รวมจาก ' + m.costTasks + ' งาน' : m.costSource === 'budget' ? 'งบประมาณรวมของยูนิต' : '') + '">' + ic('money', 15) + '<span>ประมาณการค่าก่อสร้าง</span>' +
+      (m.cost ? '<b class="num">' + fmtBaht(m.cost) + '</b>' : '<em>ยังไม่ระบุ</em>') + '</div>' +
+    '<div class="uc-current">' + (m.current ? ic(taskState(m.current) === 'late' ? 'alert' : 'wrench', 14) + '<span>' + esc(m.current.title) + '</span>' : (m.total ? ic('check', 14) + '<span>งานครบทุกรายการ</span>' : '<span class="muted">ยังไม่มีรายการงาน</span>')) + '</div>' +
+    '<div class="uc-foot">' + foot + '</div></div></article>';
+}
+AFTER.units = () => {
+  const q = $('#unit-q');
+  q.oninput = () => { S.filters.q = q.value; $('#unit-results').innerHTML = unitResults(); };
+  $('#unit-project').onchange = e => { S.filters.project = e.target.value; render(); };
+  $('#unit-type').onchange = e => { S.filters.type = e.target.value; render(); };
+};
+
+/* ===== Unit detail ===== */
+VIEWS.unit = () => {
+  const u = unitById(S.params.id);
+  if (!u) return '<div class="card empty big"><h3>ไม่พบข้อมูล</h3><button class="btn" data-act="nav" data-view="units">กลับ</button></div>';
+  const m = M(u), p = project(u.projectId);
+  const tab = S.params.tab || 'tasks';
+  const slipHtml = m.status === 'handed' ? chip('ส่งมอบแล้ว ' + fmtD(u.handoverDate), 'purple')
+    : m.slip == null ? '<span class="muted small">ยังไม่กำหนด</span>'
+    : m.slip > 0 ? '<span class="slip late">ช้ากว่ากำหนด ' + m.slip + ' วัน</span>' : '<span class="slip ok">ทันกำหนด' + (m.slip < 0 ? ' · เผื่อ ' + (-m.slip) + ' วัน' : '') + '</span>';
+  const tabs = [
+    ['tasks', 'งานซ่อม/ปรับปรุง', 'wrench', m.total],
+    ['before', 'ภาพก่อนปรับปรุง', 'camera', m.before.length],
+    ['gallery', 'รูปทั้งหมด', 'image', m.photos.length],
+    ['timeline', 'ไทม์ไลน์', 'calendar', '']
+  ];
+  const body = tab === 'before' ? unitBeforeTab(u, m) : tab === 'gallery' ? unitGalleryTab(u, m) : tab === 'timeline' ? unitTimelineTab(u, m) : unitTasksTab(u, m);
+  return '<button class="back-link" data-act="nav" data-view="units">' + ic('back', 16) + 'ห้อง / บ้านทั้งหมด</button>' +
+    '<div class="hero"><div class="hero-title"><div class="proj"><span class="proj-dot" style="background:' + esc(p.color) + '"></span>' + esc(p.name) + '</div>' +
+      '<h1>' + esc(unitLabelLong(u)) + '</h1>' +
+      '<div class="hero-chips">' + statusChip(m.status) + chip(isCondo(u) ? 'ห้องชุด' : u.unitType, 'outline') +
+        (u.floor ? chip('ชั้น ' + u.floor, 'outline') : '') + (u.area ? chip(fmtNum(u.area) + ' ตร.ม.', 'outline') : '') + (u.landArea ? chip(fmtNum(u.landArea) + ' ตร.ว.', 'outline') : '') +
+        (u.customer ? chip('ลูกค้า: ' + u.customer, 'primary') : '') + '</div>' +
+      (u.note ? '<div class="muted small" style="white-space:pre-line">' + esc(u.note) + '</div>' : '') + '</div>' +
+      '<div class="head-actions"><button class="btn" data-act="edit-unit" data-id="' + u.id + '">' + ic('edit', 16) + 'แก้ไขข้อมูล</button>' +
+      (m.status === 'ready' ? '<button class="btn primary" data-act="mark-handed" data-id="' + u.id + '">' + ic('key', 16) + 'บันทึกส่งมอบ</button>' : '') + '</div></div>' +
+    '<div class="stats">' +
+      '<div class="stat">' + ring(m.progress, 52, 6, m.status === 'late' ? 'var(--red)' : m.status === 'ready' || m.status === 'handed' ? 'var(--green)' : 'var(--primary)') + '<div><div class="lbl">ความคืบหน้ารวม</div><div class="val">' + m.progress + '%</div><div class="sub muted">ถ่วงน้ำหนักตามจำนวนวัน</div></div></div>' +
+      '<div class="stat"><div class="stat-ic">' + ic('check', 20) + '</div><div><div class="lbl">งานเสร็จ</div><div class="val num">' + m.done + ' / ' + m.total + '</div><div class="sub ' + (m.overdue ? 'slip late' : 'muted') + '">' + (m.overdue ? m.overdue + ' งานล่าช้า' : 'ไม่มีงานล่าช้า') + '</div></div></div>' +
+      '<div class="stat"><div class="stat-ic">' + ic('flag', 20) + '</div><div><div class="lbl">คาดว่าพร้อมส่งมอบ</div><div class="val">' + fmtD(m.forecast) + '</div><div class="sub muted">' + (m.forecast ? relDays(m.forecast) : 'ยังไม่มีแผนงาน') + '</div></div></div>' +
+      '<div class="stat"><div class="stat-ic">' + ic('money', 20) + '</div><div><div class="lbl">ประมาณการค่าก่อสร้าง</div><div class="val num">' + (m.cost ? fmtBaht(m.cost) : '–') + '</div><div class="sub muted">' +
+        (m.costSource === 'tasks' ? 'ทำไปแล้ว ~' + fmtBaht(Math.round(m.earned)) + (m.budget && m.budget !== m.taskCost ? ' · งบที่ตั้งไว้ ' + fmtBaht(m.budget) : '') : m.costSource === 'budget' ? 'จากงบประมาณรวม (ยังไม่แยกรายงาน)' : 'กรอกได้ในแต่ละงาน หรือที่แก้ไขข้อมูล') + '</div></div></div>' +
+      '<div class="stat"><div class="stat-ic">' + ic('key', 20) + '</div><div><div class="lbl">กำหนดส่งมอบลูกค้า</div><div class="val">' + fmtD(u.plannedHandover) + '</div><div class="sub">' + slipHtml + '</div></div></div>' +
+    '</div>' +
+    '<div class="tabs">' + tabs.map(t => '<button class="tab ' + (tab === t[0] ? 'active' : '') + '" data-act="unit-tab" data-tab="' + t[0] + '">' + ic(t[2], 16) + t[1] + (t[3] !== '' ? '<span class="count">' + t[3] + '</span>' : '') + '</button>').join('') + '</div>' +
+    '<div id="unit-tab-body">' + body + '</div>';
+};
+
+function unitTasksTab(u, m) {
+  const head = '<div class="toolbar"><button class="btn primary" data-act="new-task" data-unit="' + u.id + '">' + ic('plus', 16) + 'เพิ่มงาน</button>' +
+    '<button class="btn soft" data-act="apply-template" data-unit="' + u.id + '">' + ic('layers', 16) + 'เพิ่มจากแม่แบบงาน</button><span class="spacer"></span>' + (m.taskCost ? '<span class="chip primary" style="font-size:13px">' + ic('money', 14) + 'รวมประมาณการ ' + fmtBaht(m.taskCost) + '</span>' : '') +
+    '<span class="muted small">คลิกงานเพื่อแก้ไขรายละเอียด อัปเดต % และแนบรูป</span></div>';
+  if (!m.total) return head + '<div class="card empty big">' + ic('list', 40) + '<h3>ยังไม่มีรายการงาน</h3><div>เพิ่มงานเองทีละรายการ หรือสร้างชุดงานจากแม่แบบของประเภท “' + esc(u.unitType) + '”</div>' +
+    '<div style="margin-top:16px;display:flex;gap:10px;justify-content:center;flex-wrap:wrap"><button class="btn soft" data-act="apply-template" data-unit="' + u.id + '">' + ic('layers', 16) + 'ใช้แม่แบบงาน</button><button class="btn primary" data-act="new-task" data-unit="' + u.id + '">' + ic('plus', 16) + 'เพิ่มงาน</button></div></div>';
+  return head + '<div class="task-list">' + m.tasks.map(taskRow).join('') + '</div>';
+}
+function taskRow(t) {
+  const st = taskState(t), p = Number(t.progress) || 0;
+  const nPhotos = S.data.photos.filter(x => x.taskId === t.id).length;
+  const lateDays = st === 'late' ? diffDays(t.dueDate, todayStr()) : 0;
+  return '<div class="task-row st-' + st + '" data-act="open-task" data-id="' + t.id + '">' +
+    '<button class="task-check" data-act="toggle-done" data-id="' + t.id + '" title="' + (st === 'done' ? 'ยกเลิกเสร็จ' : 'ทำเครื่องหมายว่าเสร็จ') + '">' + ic('check', 15, 3) + '</button>' +
+    '<div style="min-width:0"><div class="task-title"><span class="seq">#' + (t.seq || '') + '</span><span class="t">' + esc(t.title) + '</span>' + (t.category ? chip(t.category, 'primary') : '') + '</div>' +
+      (t.detail ? '<div class="task-detail">' + esc(t.detail) + '</div>' : '') +
+      '<div class="task-meta"><span>' + ic('calendar', 13) + fmtD(t.startDate, false) + ' – ' + fmtD(t.dueDate) + ' (' + taskDays(t) + ' วัน)</span>' +
+        (t.contractor ? '<span>' + ic('user', 13) + esc(t.contractor) + '</span>' : '') +
+        (toNum(t.estCost) ? '<span>' + ic('money', 13) + fmtBaht(t.estCost) + '</span>' : '') +
+        (nPhotos ? '<span>' + ic('camera', 13) + nPhotos + ' รูป</span>' : '') +
+        (st === 'done' && t.finishDate ? '<span>' + ic('check', 13) + 'เสร็จ ' + fmtD(t.finishDate) + '</span>' : '') +
+        (lateDays ? '<span class="warn">' + ic('alert', 13) + 'เลยกำหนด ' + lateDays + ' วัน</span>' : '') +
+        (t.note ? '<span class="warn" style="color:var(--amber)">' + ic('info', 13) + esc(t.note) + '</span>' : '') +
+      '</div></div>' +
+    '<div class="task-side">' + progLine(p, st === 'done' ? 'green' : st === 'late' ? 'red' : '') + taskChip(st) + '</div></div>';
+}
+
+function unitBeforeTab(u, m) {
+  return '<div class="card"><div class="card-head"><h3>' + ic('camera', 18) + 'ภาพสภาพปัจจุบันก่อนปรับปรุง</h3><span class="hint">' + m.before.length + ' รูป</span></div>' +
+    '<p class="muted small" style="margin:-6px 0 14px">ถ่ายทุกมุมของห้อง/บ้าน เพื่อใช้เปรียบเทียบกับหลังปรับปรุงและเป็นหลักฐานการส่งมอบ</p>' +
+    dropzone(u.id, '', STAGES[0]) +
+    (m.before.length ? '<div class="photo-grid" style="margin-top:16px">' + m.before.map(photoTile).join('') + '</div>' : '') + '</div>';
+}
+function unitGalleryTab(u, m) {
+  const stage = S.params.stage || 'all';
+  const photos = m.photos.filter(p => stage === 'all' || p.stage === stage);
+  const seg = '<div class="seg">' + ['all'].concat(STAGES).map(s => '<button class="' + (stage === s ? 'on' : '') + '" data-act="gallery-stage" data-stage="' + s + '">' + (s === 'all' ? 'ทั้งหมด' : s) +
+    '<span class="count">' + (s === 'all' ? m.photos.length : m.photos.filter(p => p.stage === s).length) + '</span></button>').join('') + '</div>';
+  if (!photos.length) return '<div class="toolbar">' + seg + '</div><div class="card empty big">' + ic('image', 40) + '<h3>ยังไม่มีรูปภาพ</h3><div>แนบรูปได้ที่แท็บ “ภาพก่อนปรับปรุง” หรือในแต่ละงาน</div></div>';
+  const groups = [{ id: '', title: 'ภาพรวมห้อง/บ้าน' }].concat(m.tasks.map(t => ({ id: t.id, title: '#' + t.seq + ' ' + t.title })));
+  return '<div class="toolbar">' + seg + '</div>' + groups.map(g => {
+    const ps = photos.filter(p => (p.taskId || '') === g.id);
+    if (!ps.length) return '';
+    return '<div class="gallery-group"><h4>' + esc(g.title) + ' <span class="muted small" style="font-weight:400">' + ps.length + ' รูป</span></h4><div class="photo-grid sm">' + ps.map(p => photoTile(p, true)).join('') + '</div></div>';
+  }).join('');
+}
+function unitTimelineTab(u, m) {
+  if (!m.total) return '<div class="card empty big">' + ic('calendar', 40) + '<h3>ยังไม่มีแผนงาน</h3></div>';
+  const rows = m.tasks.map(t => ({ label: '#' + t.seq + ' ' + t.title, sub: t.category + (t.contractor ? ' · ' + t.contractor : ''), start: t.startDate, end: taskState(t) === 'done' && t.finishDate ? t.finishDate : t.dueDate, progress: Number(t.progress) || 0, state: taskState(t), act: 'open-task', id: t.id }));
+  return gantt(rows, { dayW: 26, markers: u.plannedHandover ? [u.plannedHandover] : [] }) + ganttLegend('task');
+}
+function dropzone(unitId, taskId, stage, compact) {
+  return '<div class="dropzone' + (compact ? ' compact' : '') + '" data-act="pick-photos" data-unit="' + unitId + '" data-task="' + (taskId || '') + '" data-stage="' + esc(stage) + '" data-drop="1">' +
+    ic('upload', compact ? 20 : 28) + '<div><b style="font-weight:500">คลิกเพื่อเลือกรูป / ถ่ายภาพ</b>' + (compact ? '' : '<br>') + '<small> หรือลากไฟล์มาวางที่นี่ (เลือกได้หลายรูป)</small></div></div>';
+}
+function photoTile(p, showStage) {
+  return '<div class="photo" data-act="open-photo" data-id="' + p.id + '"><img loading="lazy" src="' + esc(p.thumb || p.url) + '" alt="">' +
+    (showStage ? '<span class="stage-tag">' + esc(p.stage) + '</span>' : '') +
+    '<div class="cap">' + esc(p.caption || fmtD((p.createdAt || '').slice(0, 10))) + '</div></div>';
+}
+AFTER.unit = () => { bindDropzones(); scrollGanttToToday(); };
+
+/* ===== Timeline (all units) ===== */
+VIEWS.timeline = () => {
+  const pid = S.filters.project;
+  const units = unitsInScope(pid);
+  const rows = [];
+  S.data.projects.filter(p => pid === 'all' || p.id === pid).forEach(p => {
+    const us = units.filter(u => u.projectId === p.id);
+    if (!us.length) return;
+    rows.push({ group: true, label: p.name, color: p.color });
+    us.forEach(u => {
+      const m = M(u);
+      rows.push({ label: unitLabel(u), sub: unitSubLine(u).split(' · ')[0] + ' · ' + UNIT_STATUS[m.status].label, start: m.start, end: m.status === 'handed' ? u.handoverDate : m.forecast, progress: m.progress, state: m.status, marker: u.plannedHandover, act: 'open-unit', id: u.id });
+    });
+  });
+  return '<div class="page-head"><div><h1>แผนงานภาพรวม</h1><div class="sub">ช่วงเวลาซ่อม/ปรับปรุงของแต่ละยูนิต เทียบกับกำหนดส่งมอบลูกค้า</div></div>' +
+    '<div class="head-actions">' + projectSelect('tl-project', pid) + '<button class="btn primary" data-act="print-plan">' + ic('printer', 16) + 'พิมพ์ / PDF</button></div></div>' +
+    (rows.length ? gantt(rows, { dayW: 16 }) + ganttLegend('unit') : '<div class="card empty big">ยังไม่มีข้อมูล</div>');
+};
+AFTER.timeline = () => {
+  $('#tl-project').onchange = e => { S.filters.project = e.target.value; render(); };
+  scrollGanttToToday();
+};
+
+/* ===== พิมพ์แผนงานเป็น PDF =====
+   สร้างหน้ากระดาษแนวนอน (A4/A3) → แปลงเป็นภาพด้วย html2canvas → รวมเป็น PDF ด้วย jsPDF
+   ใช้ฟอนต์ Prompt ที่โหลดในหน้าเว็บ ภาษาไทยจึงแสดงถูกต้อง */
+const PDF_LIBS = window.PDF_LIBS || [
+  'https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js',
+  'https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js'
+];
+const PAPER = { A4: { W: 1123, H: 794, label: 'A4 แนวนอน' }, A3: { W: 1587, H: 1123, label: 'A3 แนวนอน' } };
+const TASK_COLORS = { done: '#3E9A6C', doing: '#4B7FD6', late: '#C94747', todo: '#BFB4B5' };
+
+function loadScript(src) {
+  return new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = src; s.onload = res;
+    s.onerror = () => rej(new Error('โหลดไลบรารีสร้าง PDF ไม่สำเร็จ (ตรวจสอบอินเทอร์เน็ต)'));
+    document.head.appendChild(s);
+  });
+}
+async function ensurePdfLibs() {
+  if (window.html2canvas && window.jspdf) return;
+  for (const src of PDF_LIBS) await loadScript(src);
+}
+
+function planRows(pid, withTasks) {
+  const rows = [];
+  S.data.projects.filter(p => pid === 'all' || p.id === pid).forEach(p => {
+    const us = unitsInScope(pid).filter(u => u.projectId === p.id);
+    if (!us.length) return;
+    rows.push({ kind: 'group', label: p.name, color: p.color, sub: us.length + ' ยูนิต' });
+    us.forEach(u => {
+      const m = M(u);
+      rows.push({ kind: 'unit', u, m, label: unitLabel(u), sub: isCondo(u) ? 'ห้องชุด' + (u.floor ? ' ชั้น ' + u.floor : '') : u.unitType,
+        start: m.start, end: m.status === 'handed' ? u.handoverDate : m.forecast, progress: m.progress, state: m.status, marker: u.plannedHandover });
+      if (withTasks) m.tasks.forEach(t => {
+        const st = taskState(t);
+        rows.push({ kind: 'task', t, label: '#' + t.seq + ' ' + t.title, sub: t.contractor || '',
+          start: t.startDate, end: st === 'done' && t.finishDate ? t.finishDate : t.dueDate, progress: Number(t.progress) || 0, state: st });
+      });
+    });
+  });
+  return rows;
+}
+const PP_ROW_H = { group: 26, unit: 32, task: 21 };
+
+function buildPlanPages(opts) {
+  const paper = PAPER[opts.paper] || PAPER.A4, W = paper.W, H = paper.H, MG = 26;
+  const rows = planRows(opts.project, opts.withTasks);
+  const today = todayStr();
+  const ds = [today];
+  rows.forEach(r => { if (r.start) ds.push(r.start); if (r.end) ds.push(r.end); if (r.marker) ds.push(r.marker); });
+  ds.sort();
+  const rStart = addDays(ds[0], -2), rEnd = addDays(ds[ds.length - 1], 3);
+  const nDays = diffDays(rStart, rEnd) + 1;
+  const COLS = [['ห้อง / บ้าน / งาน', W >= 1500 ? 250 : 190], ['สถานะ', 98], ['%', 40], ['เริ่ม', 62], ['คาดว่าเสร็จ', 70], ['ส่งมอบลูกค้า', 72]];
+  const leftW = COLS.reduce((s, c) => s + c[1], 0);
+  const GW = W - MG * 2 - leftW, dayW = GW / nDays;
+  const X = d => diffDays(rStart, d) * dayW;
+  const projName = opts.project === 'all' ? 'ทุกโครงการ' : project(opts.project).name;
+  const now = new Date();
+  const printed = fmtD(today) + ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes());
+
+  // สรุปหน้าแรก
+  const units = rows.filter(r => r.kind === 'unit');
+  const cnt = k => units.filter(r => r.state === k).length;
+  const avg = units.length ? Math.round(units.reduce((s, r) => s + r.progress, 0) / units.length) : 0;
+  const cost = units.reduce((s, r) => s + r.m.cost, 0);
+  const summary = '<div class="pp-sum">' +
+    '<span><b>' + units.length + '</b> ยูนิต</span>' +
+    Object.keys(UNIT_STATUS).map(k => cnt(k) ? '<span><i style="background:' + UNIT_STATUS[k].color + '"></i>' + UNIT_STATUS[k].label + ' <b>' + cnt(k) + '</b></span>' : '').join('') +
+    '<span>ความคืบหน้าเฉลี่ย <b>' + avg + '%</b></span>' + (cost ? '<span>ประมาณการค่าก่อสร้างรวม <b>' + fmtBaht(cost) + '</b></span>' : '') + '</div>';
+
+  // แกนเวลา
+  let months = '', days = '', bgs = '', curM = -1, mStart = 0;
+  for (let i = 0; i <= nDays; i++) {
+    const d = i < nDays ? parseD(addDays(rStart, i)) : null;
+    if (!d || d.getMonth() !== curM) {
+      if (curM >= 0) {
+        const md = parseD(addDays(rStart, mStart));
+        months += '<div style="left:' + (mStart * dayW) + 'px;width:' + ((i - mStart) * dayW) + 'px">' + ((i - mStart) * dayW > 60 ? TH_MF[md.getMonth()] + ' ' + String(md.getFullYear() + 543) : TH_M[md.getMonth()]) + '</div>';
+        if (mStart > 0) bgs += '<div class="pp-mline" style="left:' + (mStart * dayW) + 'px"></div>';
+      }
+      if (!d) break;
+      curM = d.getMonth(); mStart = i;
+    }
+    const n = d.getDate();
+    const showNum = dayW >= 15 || (dayW >= 7 && (n === 1 || (n % 5 === 0 && n <= 25))) || (dayW < 7 && (n === 1 || n === 15));
+    if (showNum) days += '<div style="left:' + (i * dayW) + 'px;width:' + Math.max(dayW, 14) + 'px">' + n + '</div>';
+    if (d.getDay() === 0 || d.getDay() === 6) bgs += '<div class="pp-we" style="left:' + (i * dayW) + 'px;width:' + dayW + 'px"></div>';
+  }
+  bgs += '<div class="pp-today" style="left:' + (X(today) + dayW / 2) + 'px"></div>';
+
+  const head = '<div class="pp-thead"><div class="pp-cols">' + COLS.map(c => '<div style="width:' + c[1] + 'px">' + c[0] + '</div>').join('') + '</div>' +
+    '<div class="pp-axis" style="width:' + GW + 'px"><div class="pp-months">' + months + '</div><div class="pp-days">' + days + '</div></div></div>';
+
+  const rowHtml = r => {
+    if (r.kind === 'group') return '<div class="pp-row pp-group" style="height:' + PP_ROW_H.group + 'px"><div class="pp-gname"><i style="background:' + esc(r.color) + '"></i>' + esc(r.label) + ' <span>' + esc(r.sub) + '</span></div></div>';
+    const isUnit = r.kind === 'unit';
+    const stLabel = isUnit ? UNIT_STATUS[r.state].label : TASK_STATUS[r.state].label;
+    const stColor = isUnit ? UNIT_STATUS[r.state].color : TASK_COLORS[r.state];
+    let bar = '';
+    if (r.start && r.end) {
+      const l = X(r.start), w = Math.max(dayW, (diffDays(r.start, r.end) + 1) * dayW);
+      bar = '<div class="pp-bar ' + r.kind + '" style="left:' + l + 'px;width:' + w + 'px;background:' + stColor + '33;border-color:' + stColor + '66"><span style="width:' + r.progress + '%;background:' + stColor + '"></span>' +
+        '</div>';
+    }
+    const mk = r.marker ? '<div class="pp-mk" style="left:' + (X(r.marker) + dayW / 2) + 'px"></div>' : '';
+    const late = isUnit && r.m.slip > 0 ? '<small class="late"> +' + r.m.slip + ' วัน</small>' : '';
+    const cells = [
+      isUnit ? '<div class="pp-name"><b>' + esc(r.label) + '</b>' + (r.sub ? '<small>' + esc(r.sub) + '</small>' : '') + '</div>'
+             : '<div class="pp-name"><b>' + esc(r.label) + (r.sub ? ' <small class="inl">· ' + esc(r.sub) + '</small>' : '') + '</b></div>',
+      '<div><span class="pp-st" style="color:' + stColor + '"><i style="background:' + stColor + '"></i>' + stLabel + '</span></div>',
+      '<div class="num">' + r.progress + '%</div>',
+      '<div class="num">' + fmtD(r.start) + '</div>',
+      '<div class="num"><b>' + fmtD(r.end) + '</b></div>',
+      '<div class="num">' + (isUnit ? fmtD(r.marker) + late : '') + '</div>'
+    ];
+    return '<div class="pp-row pp-' + r.kind + '" style="height:' + PP_ROW_H[r.kind] + 'px"><div class="pp-cols">' +
+      cells.map((c, i) => c.replace('<div', '<div style="width:' + COLS[i][1] + 'px"')).join('') + '</div>' +
+      '<div class="pp-gcell" style="width:' + GW + 'px">' + bar + mk + '</div></div>';
+  };
+
+  // แบ่งหน้า
+  const HEAD_FIRST = 92, HEAD_NEXT = 50, AXIS = 42, FOOT = 34;
+  const pages = [];
+  let cur = [], used = 0, lastGroup = null, first = true;
+  const avail = () => H - MG * 2 - (first ? HEAD_FIRST : HEAD_NEXT) - AXIS - FOOT;
+  rows.forEach((r, i) => {
+    const h = PP_ROW_H[r.kind];
+    const needKeep = r.kind === 'group' ? PP_ROW_H.unit : 0;           // ไม่ให้หัวโครงการค้างท้ายหน้า
+    if (used + h + needKeep > avail() && cur.length) {
+      pages.push(cur); cur = []; used = 0; first = false;
+      if (r.kind !== 'group' && lastGroup) { const g = Object.assign({}, lastGroup, { label: lastGroup.label + ' (ต่อ)' }); cur.push(g); used += PP_ROW_H.group; }
+    }
+    if (r.kind === 'group') lastGroup = r;
+    cur.push(r); used += h;
+  });
+  if (cur.length || !pages.length) pages.push(cur);
+
+  const legend = '<div class="pp-legend">' + Object.keys(UNIT_STATUS).map(k => '<span><i style="background:' + UNIT_STATUS[k].color + '"></i>' + UNIT_STATUS[k].label + '</span>').join('') +
+    '<span><i class="mk"></i>กำหนดส่งมอบลูกค้า</span><span><i class="td"></i>วันนี้</span><span class="muted">แถบเข้ม = ส่วนที่ทำเสร็จแล้ว</span></div>';
+
+  return pages.map((pr, i) => {
+    const bodyH = pr.reduce((s, r) => s + PP_ROW_H[r.kind], 0);
+    return '<div class="pp-page" style="width:' + W + 'px;height:' + H + 'px;padding:' + MG + 'px">' +
+      '<div class="pp-top"><div><div class="pp-title">แผนงานซ่อม/ปรับปรุง และกำหนดส่งมอบ</div><div class="pp-sub">' + esc(projName) + ' · ช่วง ' + fmtD(rStart) + ' – ' + fmtD(rEnd) + '</div></div>' +
+        '<div class="pp-meta">พิมพ์เมื่อ ' + printed + (S.data.meta.user ? '<br>' + esc(S.data.meta.user) : '') + '</div></div>' +
+      (i === 0 ? summary : '') +
+      '<div class="pp-table">' + head + '<div class="pp-body" style="height:' + bodyH + 'px"><div class="pp-bg" style="left:' + leftW + 'px;width:' + GW + 'px">' + bgs + '</div>' + pr.map(rowHtml).join('') + '</div></div>' +
+      '<div class="pp-foot">' + legend + '<div>หน้า ' + (i + 1) + ' / ' + pages.length + '</div></div></div>';
+  });
+}
+
+async function renderPlanPdf(opts, onProgress) {
+  await ensurePdfLibs();
+  if (document.fonts && document.fonts.ready) await document.fonts.ready;
+  const pages = buildPlanPages(opts);
+  const paper = PAPER[opts.paper] || PAPER.A4;
+  const host = document.createElement('div');
+  host.className = 'pp-host';
+  document.body.appendChild(host);
+  const pdf = new window.jspdf.jsPDF({ orientation: 'landscape', unit: 'pt', format: opts.paper === 'A3' ? 'a3' : 'a4', compress: true });
+  const pw = pdf.internal.pageSize.getWidth(), ph = pdf.internal.pageSize.getHeight();
+  const thumbs = [];
+  try {
+    for (let i = 0; i < pages.length; i++) {
+      onProgress && onProgress(i + 1, pages.length);
+      host.innerHTML = pages[i];
+      const canvas = await window.html2canvas(host.firstElementChild, { scale: 2, backgroundColor: '#ffffff', logging: false, useCORS: true, width: paper.W, height: paper.H, windowWidth: paper.W + 100 });
+      const img = canvas.toDataURL('image/jpeg', 0.92);
+      if (i) pdf.addPage();
+      pdf.addImage(img, 'JPEG', 0, 0, pw, ph, undefined, 'FAST');
+      thumbs.push(img);
+    }
+  } finally { host.remove(); }
+  return { pdf, thumbs };
+}
+
+function printPlanDialog() {
+  const o = S.pdfOpts = Object.assign({ project: S.filters.project, paper: 'A4', withTasks: false }, S.pdfOpts || {}, { project: S.filters.project });
+  openModal({
+    title: ic('printer', 18) + ' พิมพ์แผนงานเป็น PDF', size: 'lg',
+    body: '<div class="form-grid">' +
+      field('โครงการ', '<select class="select" id="pp-project"><option value="all">ทุกโครงการ</option>' + S.data.projects.map(p => '<option value="' + p.id + '"' + (o.project === p.id ? ' selected' : '') + '>' + esc(p.name) + '</option>').join('') + '</select>') +
+      field('ขนาดกระดาษ', '<div class="seg" id="pp-paper">' + Object.keys(PAPER).map(k => '<button type="button" data-v="' + k + '" class="' + (o.paper === k ? 'on' : '') + '">' + PAPER[k].label + '</button>').join('') + '</div>') +
+      '<div class="full"><label class="check-line"><input type="checkbox" id="pp-tasks"' + (o.withTasks ? ' checked' : '') + '> แสดงรายการงานย่อยของแต่ละยูนิต (แผนงานละเอียด)</label></div></div>' +
+      '<div id="pp-result" style="margin-top:18px"></div>',
+    foot: '<button class="btn" data-act="close-modal">ปิด</button><button class="btn primary" id="pp-make">' + ic('printer', 16) + 'สร้าง PDF</button>',
+    onMount: r => {
+      const seg = $('#pp-paper', r);
+      $$('button', seg).forEach(b => b.onclick = () => { $$('button', seg).forEach(x => x.classList.remove('on')); b.classList.add('on'); o.paper = b.dataset.v; });
+      $('#pp-project', r).onchange = e => o.project = e.target.value;
+      $('#pp-tasks', r).onchange = e => o.withTasks = e.target.checked;
+      $('#pp-make', r).onclick = async e => {
+        const btn = e.currentTarget, out = $('#pp-result', r);
+        btn.disabled = true;
+        if (S.pdfUrl) { URL.revokeObjectURL(S.pdfUrl); S.pdfUrl = null; }
+        out.innerHTML = '<div class="pp-status"><span class="spinner sm"></span><span id="pp-prog">กำลังเตรียม…</span></div>';
+        try {
+          const { pdf, thumbs } = await renderPlanPdf(o, (i, n) => { const el = $('#pp-prog'); if (el) el.textContent = 'กำลังสร้างหน้า ' + i + ' / ' + n + '…'; });
+          const name = 'แผนงาน_' + (o.project === 'all' ? 'ทุกโครงการ' : project(o.project).name).replace(/[\\/:*?"<>|\s]+/g, '-') + '_' + todayStr() + '.pdf';
+          const blob = pdf.output('blob');
+          S.pdfUrl = URL.createObjectURL(blob);
+          S.pdfFile = { name, blob };
+          out.innerHTML = '<div class="pp-ready"><div class="pp-ready-head">' + ic('check', 18, 2.5) + '<div><b>สร้าง PDF เรียบร้อย</b><div class="muted small">' + esc(name) + ' · ' + thumbs.length + ' หน้า · ' + (blob.size / 1024 / 1024).toFixed(1) + ' MB</div></div></div>' +
+            '<div class="pp-actions"><a class="btn primary" href="' + S.pdfUrl + '" download="' + esc(name) + '">' + ic('download', 16) + 'ดาวน์โหลด PDF</a>' +
+            '<a class="btn" href="' + S.pdfUrl + '" target="_blank" rel="noopener">' + ic('external', 16) + 'เปิดดู / สั่งพิมพ์</a>' +
+            '<button class="btn soft" data-act="pdf-drive">' + ic('folder', 16) + 'บันทึกลง Google Drive</button></div>' +
+            '<div id="pp-drive"></div>' +
+            '<div class="pp-thumbs">' + thumbs.map((t, i) => '<figure><img src="' + t + '" alt=""><figcaption>หน้า ' + (i + 1) + '</figcaption></figure>').join('') + '</div></div>';
+        } catch (err) {
+          out.innerHTML = '<div class="pp-status error">' + ic('alert', 16) + esc(err.message || String(err)) + '</div>';
+        } finally { btn.disabled = false; btn.innerHTML = ic('refresh', 16) + 'สร้างใหม่'; }
+      };
+    }
+  });
+}
+function blobToBase64(blob) {
+  return new Promise((res, rej) => { const fr = new FileReader(); fr.onload = () => res(String(fr.result).split(',')[1]); fr.onerror = rej; fr.readAsDataURL(blob); });
+}
+
+function gantt(rows, opts) {
+  const dayW = opts.dayW || 18, today = todayStr();
+  const dates = [today];
+  rows.forEach(r => { if (r.start) dates.push(r.start); if (r.end) dates.push(r.end); if (r.marker) dates.push(r.marker); });
+  (opts.markers || []).forEach(d => dates.push(d));
+  dates.sort();
+  const start = addDays(dates[0], -3), end = addDays(dates[dates.length - 1], 5);
+  const nDays = diffDays(start, end) + 1, W = nDays * dayW;
+  const x = d => diffDays(start, d) * dayW;
+  let months = '', days = '', curM = -1, mStart = 0;
+  for (let i = 0; i < nDays; i++) {
+    const d = parseD(addDays(start, i));
+    if (d.getMonth() !== curM) {
+      if (curM >= 0) months += '<div style="width:' + (i - mStart) * dayW + 'px">' + TH_MF[curM] + '</div>';
+      curM = d.getMonth(); mStart = i;
+      var mYear = d.getFullYear() + 543;
+    }
+    const we = d.getDay() === 0 || d.getDay() === 6;
+    days += '<div class="' + (we ? 'we' : '') + '" style="width:' + dayW + 'px">' + (dayW >= 16 || d.getDate() % 5 === 1 ? d.getDate() : '') + '</div>';
+  }
+  months += '<div style="width:' + (nDays - mStart) * dayW + 'px">' + TH_MF[curM] + ' ' + mYear + '</div>';
+  const todayLine = '<div class="g-today" style="left:' + (x(today) + dayW / 2) + 'px"></div>';
+  const body = rows.map(r => {
+    if (r.group) return '<div class="g-row group"><div class="g-label"><span class="proj-dot" style="background:' + esc(r.color) + '"></span>' + esc(r.label) + '</div><div class="g-track" style="width:' + W + 'px;min-height:34px">' + todayLine + '</div></div>';
+    let bar = '';
+    if (r.start && r.end) {
+      const l = x(r.start), w = Math.max(dayW, (diffDays(r.start, r.end) + 1) * dayW);
+      bar = '<div class="g-bar st-' + r.state + '" style="left:' + l + 'px;width:' + w + 'px" title="' + esc(r.label + ' · ' + fmtD(r.start) + ' – ' + fmtD(r.end) + ' · ' + r.progress + '%') + '"><span style="width:' + r.progress + '%"></span>' + (w > 50 ? '<em class="g-txt" style="font-style:normal">' + r.progress + '%</em>' : '') + '</div>';
+    }
+    const mk = r.marker ? '<div class="g-marker" style="left:' + (x(r.marker) + dayW / 2) + 'px" title="กำหนดส่งมอบ ' + fmtD(r.marker) + '"></div>' : '';
+    const mks = (opts.markers || []).map(d => '<div class="g-today" style="left:' + (x(d) + dayW / 2) + 'px;background:var(--primary-700);opacity:.35;width:2px"></div>').join('');
+    return '<div class="g-row" data-act="' + r.act + '" data-id="' + r.id + '"><div class="g-label"><b>' + esc(r.label) + '</b>' + (r.sub ? '<small>' + esc(r.sub) + '</small>' : '') + '</div>' +
+      '<div class="g-track" style="width:' + W + 'px">' + todayLine + mks + bar + mk + '</div></div>';
+  }).join('');
+  return '<div class="gantt" id="gantt" data-today-x="' + x(today) + '"><div class="g-inner" style="width:' + (W + 230) + 'px">' +
+    '<div class="g-head"><div class="g-label">' + (opts.markers && opts.markers.length ? 'งาน · เส้นทึบจาง = กำหนดส่งมอบ' : 'ห้อง / บ้าน') + '</div><div class="g-scale" style="width:' + W + 'px"><div class="g-months">' + months + '</div><div class="g-days">' + days + '</div></div></div>' +
+    body + '</div></div>';
+}
+function ganttLegend(kind) {
+  const items = kind === 'task'
+    ? [['#3E9A6C', 'เสร็จแล้ว'], ['#4B7FD6', 'กำลังทำ'], ['#C94747', 'ล่าช้า'], ['#BFB4B5', 'รอดำเนินการ']]
+    : Object.keys(UNIT_STATUS).map(k => [UNIT_STATUS[k].color, UNIT_STATUS[k].label]);
+  return '<div class="g-legend">' + items.map(i => '<span><i style="background:' + i[0] + '"></i>' + i[1] + '</span>').join('') +
+    (kind === 'unit' ? '<span><i class="mk"></i>กำหนดส่งมอบลูกค้า</span>' : '') + '<span><i class="td"></i>วันนี้</span></div>';
+}
+function scrollGanttToToday() {
+  const g = $('#gantt'); if (!g) return;
+  const tx = Number(g.dataset.todayX) || 0;
+  g.scrollLeft = Math.max(0, tx - (g.clientWidth - 230) / 3);
+}
+
+/* ===== Settings ===== */
+VIEWS.settings = () => {
+  const tab = S.params.tab || 'projects';
+  const tabs = [['projects', 'โครงการ', 'building'], ['templates', 'แม่แบบงาน', 'layers'], ['system', 'ข้อมูลระบบ', 'info']];
+  const body = tab === 'templates' ? settingsTemplates() : tab === 'system' ? settingsSystem() : settingsProjects();
+  return '<div class="page-head"><div><h1>ตั้งค่า</h1><div class="sub">จัดการโครงการ แม่แบบงาน และข้อมูลระบบ</div></div></div>' +
+    '<div class="tabs">' + tabs.map(t => '<button class="tab ' + (tab === t[0] ? 'active' : '') + '" data-act="settings-tab" data-tab="' + t[0] + '">' + ic(t[2], 16) + t[1] + '</button>').join('') + '</div>' + body;
+};
+function settingsProjects() {
+  return '<div class="toolbar"><button class="btn primary" data-act="new-project">' + ic('plus', 16) + 'เพิ่มโครงการ</button></div>' +
+    '<div class="set-list">' + (S.data.projects.length ? S.data.projects.map(p => {
+      const us = S.data.units.filter(u => u.projectId === p.id);
+      return '<div class="set-item"><span class="proj-dot" style="width:16px;height:16px;background:' + esc(p.color) + '"></span><div class="grow"><b>' + esc(p.name) + '</b>' + (p.code ? ' <span class="muted small">(' + esc(p.code) + ')</span>' : '') +
+        '<div class="muted small">' + us.length + ' ยูนิต' + (p.location ? ' · ' + esc(p.location) : '') + (p.description ? ' · ' + esc(p.description) : '') + '</div></div>' +
+        '<button class="btn sm" data-act="edit-project" data-id="' + p.id + '">' + ic('edit', 14) + 'แก้ไข</button></div>';
+    }).join('') : '<div class="card empty">ยังไม่มีโครงการ</div>') + '</div>';
+}
+function settingsTemplates() {
+  const types = unitTypes();
+  const t = S.params.ttype || types[0];
+  const rows = S.data.templates.filter(x => x.unitType === t).sort(bySeq);
+  const total = rows.reduce((s, r) => s + (Number(r.days) || 0), 0);
+  return '<p class="muted small" style="margin-top:0">แม่แบบงานใช้สร้างรายการงานให้ห้อง/บ้านใหม่ได้ในคลิกเดียว (งานจะเรียงต่อกันตามลำดับและจำนวนวัน)</p>' +
+    '<div class="toolbar"><div class="seg">' + types.map(x => '<button class="' + (x === t ? 'on' : '') + '" data-act="tpl-type" data-type="' + esc(x) + '">' + esc(x) + '<span class="count">' + S.data.templates.filter(y => y.unitType === x).length + '</span></button>').join('') + '</div>' +
+    '<span class="spacer"></span><button class="btn primary" data-act="new-template" data-type="' + esc(t) + '">' + ic('plus', 16) + 'เพิ่มขั้นตอน</button></div>' +
+    '<div class="card">' + (rows.length ? '<div class="table-wrap"><table class="tbl tpl-table" style="min-width:560px"><thead><tr><th>ลำดับ</th><th>หมวดงาน</th><th>ชื่องาน</th><th>จำนวนวัน</th><th style="text-align:right">ประมาณการ (บาท)</th><th></th></tr></thead><tbody>' +
+      rows.map(r => '<tr><td class="num">' + r.seq + '</td><td>' + chip(r.category || '–', 'primary') + '</td><td>' + esc(r.title) + (r.detail ? '<div class="muted small">' + esc(r.detail) + '</div>' : '') + '</td><td class="num">' + r.days + ' วัน</td><td class="num" style="text-align:right">' + (toNum(r.estCost) ? toNum(r.estCost).toLocaleString('th-TH') : '–') + '</td>' +
+        '<td style="text-align:right;white-space:nowrap"><button class="icon-btn" data-act="edit-template" data-id="' + r.id + '" title="แก้ไข">' + ic('edit', 16) + '</button><button class="icon-btn" data-act="delete-template" data-id="' + r.id + '" title="ลบ">' + ic('trash', 16) + '</button></td></tr>').join('') +
+      '</tbody></table></div><div class="muted small" style="margin-top:12px">รวม ' + rows.length + ' ขั้นตอน · ประมาณ ' + total + ' วัน' + (rows.some(r => toNum(r.estCost)) ? ' · ประมาณการรวม ' + fmtBaht(rows.reduce((s, r) => s + toNum(r.estCost), 0)) : '') + '</div>'
+      : '<div class="empty">ยังไม่มีแม่แบบสำหรับ “' + esc(t) + '”</div>') + '</div>';
+}
+function settingsSystem() {
+  const mt = S.data.meta;
+  return '<div class="grid-2 even"><div class="card"><div class="card-head"><h3>' + ic('info', 18) + 'ข้อมูลระบบ</h3></div><dl class="kv">' +
+    '<dt>ผู้ใช้งาน</dt><dd>' + esc(mt.user || '–') + '</dd>' +
+    '<dt>เวอร์ชัน</dt><dd>' + esc(mt.version || '') + '</dd>' +
+    '<dt>ฐานข้อมูล (Google Sheet)</dt><dd>' + (mt.sheetUrl ? '<a href="' + esc(mt.sheetUrl) + '" target="_blank">' + ic('sheet', 14) + ' เปิดชีต</a>' : '–') + '</dd>' +
+    '<dt>โฟลเดอร์รูปภาพ (Drive)</dt><dd>' + (mt.folderUrl ? '<a href="' + esc(mt.folderUrl) + '" target="_blank">' + ic('folder', 14) + ' เปิดโฟลเดอร์</a>' : '–') + '</dd>' +
+    '<dt>จำนวนข้อมูล</dt><dd>' + S.data.projects.length + ' โครงการ · ' + S.data.units.length + ' ยูนิต · ' + S.data.tasks.length + ' งาน · ' + S.data.photos.length + ' รูป</dd></dl></div>' +
+    '<div class="card"><div class="card-head"><h3>' + ic('layers', 18) + 'โครงสร้างข้อมูล</h3></div><dl class="kv">' +
+    '<dt>Projects</dt><dd>โครงการ</dd><dt>Units</dt><dd>ห้องชุด / บ้าน (ผูกกับโครงการ)</dd><dt>Tasks</dt><dd>งานซ่อม/ปรับปรุงของแต่ละยูนิต</dd>' +
+    '<dt>Photos</dt><dd>รูปภาพ (ไฟล์เก็บใน Drive) แยกตามขั้นตอน</dd><dt>Templates</dt><dd>แม่แบบงานตามประเภทยูนิต</dd><dt>Logs</dt><dd>ประวัติการแก้ไขทั้งหมด</dd></dl>' +
+    '<p class="muted small">เพิ่มคอลัมน์ใหม่ได้โดยแก้ SCHEMA ใน Code.gs — ระบบจะเติมคอลัมน์ในชีตให้อัตโนมัติ</p></div></div>';
+}
+
+/* ---------------- 6) Modals & Forms ---------------- */
+function openModal({ title, body, foot, size = '', onMount }) {
+  const root = $('#modal-root');
+  root.innerHTML = '<div class="modal-backdrop" data-close-bg="1"><div class="modal ' + size + '" role="dialog"><div class="modal-head"><h3>' + title + '</h3><button class="icon-btn" data-act="close-modal">' + ic('x', 18) + '</button></div>' +
+    '<div class="modal-body">' + body + '</div>' + (foot ? '<div class="modal-foot">' + foot + '</div>' : '') + '</div></div>';
+  document.body.style.overflow = 'hidden';
+  const bg = $('.modal-backdrop', root);
+  bg.addEventListener('mousedown', e => { if (e.target === bg) closeModal(); });
+  if (onMount) onMount(root);
+  const first = $('input:not([type=hidden]):not([type=range]),select,textarea', root);
+  if (first && window.innerWidth > 900) setTimeout(() => first.focus(), 50);
+}
+function closeModal() { $('#modal-root').innerHTML = ''; document.body.style.overflow = ''; }
+function confirmBox(message, okLabel = 'ยืนยัน', danger = true) {
+  return new Promise(resolve => {
+    openModal({
+      title: 'ยืนยันการทำรายการ', size: 'sm',
+      body: '<div style="white-space:pre-line">' + message + '</div>',
+      foot: '<button class="btn" id="cf-no">ยกเลิก</button><button class="btn ' + (danger ? 'danger' : 'primary') + '" id="cf-ok">' + okLabel + '</button>',
+      onMount: r => { $('#cf-no', r).onclick = () => { closeModal(); resolve(false); }; $('#cf-ok', r).onclick = () => { closeModal(); resolve(true); }; }
+    });
+  });
+}
+function formData(root) {
+  const o = {};
+  $$('[name]', root).forEach(el => { o[el.name] = el.type === 'checkbox' ? el.checked : el.value.trim(); });
+  return o;
+}
+function field(label, input, cls = '', help = '') {
+  return '<div class="field ' + cls + '"><label>' + label + '</label>' + input + (help ? '<div class="help">' + help + '</div>' : '') + '</div>';
+}
+const inp = (name, value, attrs = '') => '<input class="input" name="' + name + '" value="' + esc(value == null ? '' : value) + '" ' + attrs + '>';
+const sel = (name, value, options) => '<select class="select" name="' + name + '">' + options.map(o => { const v = Array.isArray(o) ? o[0] : o, l = Array.isArray(o) ? o[1] : o; return '<option value="' + esc(v) + '"' + (String(v) === String(value) ? ' selected' : '') + '>' + esc(l) + '</option>'; }).join('') + '</select>';
+
+async function busy(btn, fn) {
+  const label = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner sm"></span>กำลังบันทึก…'; }
+  try { return await fn(); }
+  catch (e) { toast(e.message || String(e), 'error'); throw e; }
+  finally { if (btn && btn.isConnected) { btn.disabled = false; btn.innerHTML = label; } }
+}
+function upsertLocal(coll, rec) {
+  const arr = S.data[coll], i = arr.findIndex(x => x.id === rec.id);
+  if (i >= 0) arr[i] = rec; else arr.push(rec);
+  S.ver++;
+}
+function removeLocal(coll, pred) { S.data[coll] = S.data[coll].filter(x => !pred(x)); S.ver++; }
+function refreshView() { renderNav(); render(); }
+
+/* --- Project form --- */
+function projectForm(p) {
+  const isNew = !p;
+  p = p || { color: PROJECT_COLORS[S.data.projects.length % PROJECT_COLORS.length] };
+  openModal({
+    title: isNew ? 'เพิ่มโครงการ' : 'แก้ไขโครงการ',
+    body: '<div class="form-grid">' +
+      field('ชื่อโครงการ *', inp('name', p.name, 'placeholder="เช่น คอนโด เอเซ่"'), 'full') +
+      field('รหัสโครงการ', inp('code', p.code, 'placeholder="เช่น ACE"')) +
+      field('ที่ตั้ง', inp('location', p.location)) +
+      field('วันเริ่มโครงการ', inp('startDate', p.startDate, 'type="date"')) +
+      field('เป้าหมายส่งมอบทั้งโครงการ', inp('targetDate', p.targetDate, 'type="date"')) +
+      field('รายละเอียด', '<textarea class="textarea" name="description" rows="2">' + esc(p.description) + '</textarea>', 'full') +
+      field('สีประจำโครงการ', '<input type="hidden" name="color" value="' + esc(p.color) + '"><div class="swatches">' + PROJECT_COLORS.map(c => '<button type="button" class="swatch ' + (c === p.color ? 'on' : '') + '" style="background:' + c + '" data-color="' + c + '"></button>').join('') + '</div>', 'full') +
+      '</div>',
+    foot: (isNew ? '' : '<button class="btn danger left" id="pf-del">' + ic('trash', 16) + 'ลบโครงการ</button>') + '<button class="btn" data-act="close-modal">ยกเลิก</button><button class="btn primary" id="pf-save">บันทึก</button>',
+    onMount: r => {
+      $$('.swatch', r).forEach(b => b.onclick = () => { $$('.swatch', r).forEach(x => x.classList.remove('on')); b.classList.add('on'); $('[name=color]', r).value = b.dataset.color; });
+      $('#pf-save', r).onclick = e => busy(e.currentTarget, async () => {
+        const d = formData(r); if (!d.name) throw new Error('กรุณาระบุชื่อโครงการ');
+        if (!isNew) d.id = p.id;
+        const rec = await api('saveProject', d);
+        upsertLocal('projects', rec); closeModal(); refreshView(); toast('บันทึกโครงการแล้ว', 'success');
+      });
+      const del = $('#pf-del', r);
+      if (del) del.onclick = async () => {
+        const n = S.data.units.filter(u => u.projectId === p.id).length;
+        if (!await confirmBox('ลบโครงการ “' + esc(p.name) + '” ?\nห้อง/บ้าน ' + n + ' ยูนิต รวมถึงงานและรูปภาพทั้งหมดในโครงการจะถูกลบด้วย', 'ลบโครงการ')) return;
+        try {
+          toast('กำลังลบ…');
+          await api('deleteProject', { id: p.id });
+          const uids = new Set(S.data.units.filter(u => u.projectId === p.id).map(u => u.id));
+          removeLocal('photos', x => uids.has(x.unitId)); removeLocal('tasks', x => uids.has(x.unitId)); removeLocal('units', x => uids.has(x.id)); removeLocal('projects', x => x.id === p.id);
+          if (S.filters.project === p.id) S.filters.project = 'all';
+          refreshView(); toast('ลบโครงการแล้ว', 'success');
+        } catch (e) { toast(e.message, 'error'); }
+      };
+    }
+  });
+}
+
+/* --- Unit form --- */
+function unitForm(u, defaults = {}) {
+  const isNew = !u;
+  if (!S.data.projects.length) { toast('กรุณาสร้างโครงการก่อน', 'error'); return go('settings'); }
+  u = u || Object.assign({ projectId: S.filters.project !== 'all' ? S.filters.project : S.data.projects[0].id, unitType: 'คอนโด' }, defaults);
+  const types = unitTypes();
+  openModal({
+    title: isNew ? 'เพิ่มห้อง / บ้าน' : 'แก้ไขข้อมูล ' + esc(unitLabel(u)),
+    body: '<div class="form-grid">' +
+      field('โครงการ *', sel('projectId', u.projectId, S.data.projects.map(p => [p.id, p.name]))) +
+      field('ประเภท *', sel('unitType', u.unitType, types)) +
+      field('เลขที่ห้องชุด / บ้านเลขที่ *', inp('unitNo', u.unitNo, 'placeholder="เช่น 85 หรือ 100/015"')) +
+      field('ชั้น', inp('floor', u.floor, 'placeholder="เช่น 7"')) +
+      field('พื้นที่ใช้สอย (ตร.ม.)', inp('area', u.area, 'type="number" step="0.01" min="0"')) +
+      field('ที่ดิน (ตร.ว.)', inp('landArea', u.landArea, 'type="number" step="0.01" min="0"'), '', 'สำหรับบ้าน/อาคาร (คอนโดเว้นว่างได้)') +
+      field('งบประมาณค่าก่อสร้างรวม (บาท)', inp('budget', u.budget, 'type="number" inputmode="decimal" step="0.01" min="0" placeholder="0"'), 'full', 'ถ้ากรอกค่าใช้จ่ายในแต่ละงานแล้ว การ์ดจะแสดงยอดรวมจากรายงานแทน') +
+      field('ชื่อลูกค้า', inp('customer', u.customer)) +
+      field('เบอร์ติดต่อ', inp('phone', u.phone, 'type="tel"')) +
+      field('กำหนดส่งมอบลูกค้า', inp('plannedHandover', u.plannedHandover, 'type="date"'), '', 'ใช้เทียบว่าทันกำหนดหรือล่าช้า') +
+      field('วันที่ส่งมอบจริง', inp('handoverDate', u.handoverDate, 'type="date"'), '', 'กรอกเมื่อส่งมอบลูกค้าแล้ว') +
+      field('หมายเหตุ', '<textarea class="textarea" name="note" rows="2">' + esc(u.note) + '</textarea>', 'full') +
+      (isNew ? '<div class="full card" style="background:var(--primary-50);border-color:var(--primary-100);padding:14px">' +
+        '<label class="check-line"><input type="checkbox" name="useTemplate" checked> สร้างรายการงานจากแม่แบบของประเภทนี้อัตโนมัติ</label>' +
+        '<div class="field" style="margin-top:10px">' + '<label>เริ่มงานวันที่</label>' + inp('tplStart', todayStr(), 'type="date"') + '</div></div>' : '') +
+      '</div>',
+    foot: (isNew ? '' : '<button class="btn danger left" id="uf-del">' + ic('trash', 16) + 'ลบ</button>') + '<button class="btn" data-act="close-modal">ยกเลิก</button><button class="btn primary" id="uf-save">บันทึก</button>',
+    onMount: r => {
+      $('#uf-save', r).onclick = e => busy(e.currentTarget, async () => {
+        const d = formData(r);
+        if (!d.unitNo) throw new Error('กรุณาระบุเลขที่ห้อง/บ้าน');
+        const useTpl = d.useTemplate, tplStart = d.tplStart;
+        d.budget = d.budget === '' ? '' : toNum(d.budget);
+        delete d.useTemplate; delete d.tplStart;
+        if (!isNew) d.id = u.id;
+        const rec = await api('saveUnit', d);
+        upsertLocal('units', rec);
+        if (isNew && useTpl) {
+          try { const tasks = await api('applyTemplate', { unitId: rec.id, startDate: tplStart }); tasks.forEach(t => S.data.tasks.push(t)); S.ver++; }
+          catch (err) { toast(err.message, 'error'); }
+        }
+        closeModal(); toast('บันทึกแล้ว', 'success');
+        if (isNew) go('unit', { id: rec.id }); else refreshView();
+      });
+      const del = $('#uf-del', r);
+      if (del) del.onclick = async () => {
+        if (!await confirmBox('ลบ ' + esc(unitLabelLong(u)) + ' ?\nงานและรูปภาพทั้งหมดของยูนิตนี้จะถูกลบด้วย', 'ลบ')) return;
+        try {
+          toast('กำลังลบ…');
+          await api('deleteUnit', { id: u.id });
+          removeLocal('photos', x => x.unitId === u.id); removeLocal('tasks', x => x.unitId === u.id); removeLocal('units', x => x.id === u.id);
+          toast('ลบแล้ว', 'success'); go('units');
+        } catch (e) { toast(e.message, 'error'); }
+      };
+    }
+  });
+}
+
+/* --- Task form --- */
+function taskForm(t, unitId) {
+  const isNew = !t;
+  const u = unitById(isNew ? unitId : t.unitId);
+  if (!u) return;
+  if (isNew) {
+    const last = tasksOf(u.id).slice(-1)[0];
+    const s = last && last.dueDate ? addDays(last.dueDate, 1) : todayStr();
+    t = { unitId: u.id, category: '', title: '', detail: '', startDate: s, dueDate: addDays(s, 1), progress: 0 };
+  }
+  const cats = Array.from(new Set(S.data.tasks.map(x => x.category).concat(S.data.templates.map(x => x.category)).filter(Boolean)));
+  const p = Number(t.progress) || 0;
+  const defStage = p >= 100 ? STAGES[2] : p > 0 ? STAGES[1] : STAGES[0];
+  openModal({
+    title: (isNew ? 'เพิ่มงาน · ' : 'งาน #' + t.seq + ' · ') + esc(unitLabel(u)), size: 'lg',
+    body: '<div class="form-grid">' +
+      field('ชื่องาน *', inp('title', t.title, 'placeholder="เช่น ซ่อมผนังห้องนอน"'), 'full') +
+      field('หมวดงาน', inp('category', t.category, 'list="cat-list" placeholder="เช่น งานระบบ"') + '<datalist id="cat-list">' + cats.map(c => '<option value="' + esc(c) + '">').join('') + '</datalist>') +
+      field('ผู้รับเหมา / ช่าง', inp('contractor', t.contractor, 'placeholder="ชื่อทีมช่าง"')) +
+      field('ประมาณการค่าใช้จ่าย (บาท)', inp('estCost', t.estCost, 'type="number" inputmode="decimal" step="0.01" min="0" placeholder="0"'), '', 'ค่าแรง + ค่าวัสดุ ของงานนี้') +
+      '<div class="field"><label>&nbsp;</label><div class="help" id="tf-cost" style="padding-top:10px;font-size:14px;color:var(--primary-700)"></div></div>' +
+      field('รายละเอียดงาน', '<textarea class="textarea" name="detail" rows="4" placeholder="พิมพ์รายละเอียดงาน ขอบเขต วัสดุที่ใช้ ข้อควรระวัง…">' + esc(t.detail) + '</textarea>', 'full') +
+      '</div><div class="form-grid three" style="margin-top:14px">' +
+      field('วันเริ่มงาน', inp('startDate', t.startDate, 'type="date"')) +
+      field('วันกำหนดเสร็จ', inp('dueDate', t.dueDate, 'type="date"'), '', '<span id="tf-days"></span>') +
+      field('วันที่เสร็จจริง', inp('finishDate', t.finishDate, 'type="date" ' + (p < 100 ? 'disabled' : '')), '', 'บันทึกอัตโนมัติเมื่อครบ 100%') +
+      '</div>' +
+      '<div class="field" style="margin-top:14px"><label>ความคืบหน้า</label><div class="range-wrap"><input type="range" name="progress" min="0" max="100" step="5" value="' + p + '"><span class="range-val" id="tf-pv">' + p + '%</span></div>' +
+      '<div class="quick-pcts">' + [0, 25, 50, 75, 100].map(v => '<button type="button" data-v="' + v + '" class="' + (v === p ? 'on' : '') + '">' + (v === 100 ? 'เสร็จ 100%' : v + '%') + '</button>').join('') + '</div></div>' +
+      '<div style="margin-top:14px">' + field('หมายเหตุ / ปัญหาที่พบ', inp('note', t.note, 'placeholder="เช่น รอวัสดุ, ต้องแก้ไขเพิ่ม"')) + '</div>' +
+      '<div class="section-title">' + ic('camera', 18) + 'รูปภาพการทำงาน</div>' +
+      (isNew ? '<div class="muted small">บันทึกงานก่อน แล้วจึงแนบรูปภาพได้</div>'
+        : '<div class="toolbar"><div class="seg" id="tf-stage">' + STAGES.map(s => '<button type="button" class="' + (s === defStage ? 'on' : '') + '" data-stage="' + esc(s) + '">' + esc(s) + '</button>').join('') + '</div></div>' +
+          '<div id="tf-drop">' + dropzone(u.id, t.id, defStage, true) + '</div><div id="tf-photos" style="margin-top:14px">' + taskPhotosHtml(t.id) + '</div>'),
+    foot: (isNew ? '' : '<button class="btn danger left" id="tf-del">' + ic('trash', 16) + 'ลบงาน</button>') + '<button class="btn" data-act="close-modal">ปิด</button><button class="btn primary" id="tf-save">' + (isNew ? 'บันทึกและแนบรูป' : 'บันทึก') + '</button>',
+    onMount: r => {
+      const range = $('[name=progress]', r), pv = $('#tf-pv', r), fin = $('[name=finishDate]', r);
+      const updDays = () => { const s = $('[name=startDate]', r).value, d = $('[name=dueDate]', r).value; $('#tf-days', r).textContent = s && d ? (d < s ? 'วันกำหนดเสร็จก่อนวันเริ่ม' : 'ระยะเวลา ' + (diffDays(s, d) + 1) + ' วัน') : ''; };
+      const setP = v => { range.value = v; pv.textContent = v + '%'; $$('.quick-pcts button', r).forEach(b => b.classList.toggle('on', Number(b.dataset.v) === Number(v))); fin.disabled = Number(v) < 100; if (Number(v) >= 100 && !fin.value) fin.value = todayStr(); };
+      const costIn = $('[name=estCost]', r), costOut = $('#tf-cost', r);
+      const updCost = () => { costOut.textContent = costIn.value ? '= ' + fmtBaht(costIn.value) : ''; };
+      costIn.oninput = updCost; updCost();
+      range.oninput = () => setP(range.value);
+      $$('.quick-pcts button', r).forEach(b => b.onclick = () => setP(b.dataset.v));
+      $('[name=startDate]', r).onchange = updDays; $('[name=dueDate]', r).onchange = updDays; updDays();
+      const seg = $('#tf-stage', r);
+      if (seg) $$('button', seg).forEach(b => b.onclick = () => {
+        $$('button', seg).forEach(x => x.classList.remove('on')); b.classList.add('on');
+        $('#tf-drop', r).innerHTML = dropzone(u.id, t.id, b.dataset.stage, true); bindDropzones(r);
+      });
+      bindDropzones(r);
+      $('#tf-save', r).onclick = e => busy(e.currentTarget, async () => {
+        const d = formData(r);
+        if (!d.title) throw new Error('กรุณาระบุชื่องาน');
+        if (d.startDate && d.dueDate && d.dueDate < d.startDate) throw new Error('วันกำหนดเสร็จต้องไม่ก่อนวันเริ่มงาน');
+        d.progress = Number(d.progress); d.unitId = u.id;
+        d.estCost = d.estCost === '' ? '' : toNum(d.estCost);
+        if (!fin.disabled) d.finishDate = fin.value;
+        if (!isNew) { d.id = t.id; d.seq = t.seq; }
+        const rec = await api('saveTask', d);
+        upsertLocal('tasks', rec); refreshView();
+        if (isNew) { toast('บันทึกงานแล้ว — แนบรูปได้เลย', 'success'); taskForm(rec); }
+        else { closeModal(); toast('บันทึกงานแล้ว', 'success'); }
+      });
+      const del = $('#tf-del', r);
+      if (del) del.onclick = async () => {
+        const n = S.data.photos.filter(x => x.taskId === t.id).length;
+        if (!await confirmBox('ลบงาน “' + esc(t.title) + '” ?' + (n ? '\nรูปภาพของงานนี้ ' + n + ' รูปจะถูกลบด้วย' : ''), 'ลบงาน')) return;
+        try { await api('deleteTask', { id: t.id }); removeLocal('photos', x => x.taskId === t.id); removeLocal('tasks', x => x.id === t.id); refreshView(); toast('ลบงานแล้ว', 'success'); }
+        catch (e) { toast(e.message, 'error'); }
+      };
+    }
+  });
+}
+function taskPhotosHtml(taskId) {
+  const ps = S.data.photos.filter(p => p.taskId === taskId);
+  if (!ps.length) return '<div class="muted small">ยังไม่มีรูปของงานนี้</div>';
+  return '<div class="stage-cols">' + STAGES.map(s => {
+    const list = ps.filter(p => p.stage === s);
+    return '<div class="stage-col"><h5>' + esc(s) + ' <span class="muted">(' + list.length + ')</span></h5>' + (list.length ? '<div class="photo-grid sm">' + list.map(p => photoTile(p)).join('') + '</div>' : '<div class="muted small">–</div>') + '</div>';
+  }).join('') + '</div>';
+}
+
+/* --- Apply template --- */
+function applyTemplateForm(unitId) {
+  const u = unitById(unitId);
+  const tpl = S.data.templates.filter(t => t.unitType === u.unitType).sort(bySeq);
+  const last = tasksOf(u.id).slice(-1)[0];
+  const start = last && last.dueDate ? addDays(last.dueDate, 1) : todayStr();
+  const total = tpl.reduce((s, t) => s + (Number(t.days) || 0), 0);
+  openModal({
+    title: 'เพิ่มงานจากแม่แบบ · ' + esc(unitLabel(u)),
+    body: tpl.length
+      ? '<p style="margin-top:0">แม่แบบ “<b>' + esc(u.unitType) + '</b>” มี ' + tpl.length + ' ขั้นตอน รวมประมาณ ' + total + ' วัน งานจะถูกต่อท้ายรายการเดิม</p>' +
+        field('เริ่มงานวันที่', inp('startDate', start, 'type="date"'), '', 'คาดว่าจะเสร็จ: <b id="at-end"></b>') +
+        '<div class="list" style="margin-top:14px;max-height:260px;overflow:auto">' + tpl.map(t => '<div class="list-item" style="cursor:default;padding:7px 0"><span class="muted small" style="width:22px">' + t.seq + '</span><div class="li-main">' + esc(t.title) + '</div>' + chip(t.days + ' วัน', 'outline') + '</div>').join('') + '</div>'
+      : '<div class="empty">ยังไม่มีแม่แบบสำหรับประเภท “' + esc(u.unitType) + '”<br>เพิ่มได้ที่ ตั้งค่า › แม่แบบงาน</div>',
+    foot: '<button class="btn" data-act="close-modal">ยกเลิก</button>' + (tpl.length ? '<button class="btn primary" id="at-ok">สร้าง ' + tpl.length + ' งาน</button>' : ''),
+    onMount: r => {
+      const s = $('[name=startDate]', r); if (!s) return;
+      const upd = () => $('#at-end', r).textContent = s.value ? fmtDLong(addDays(s.value, total - 1)) : '–';
+      s.onchange = upd; upd();
+      $('#at-ok', r).onclick = e => busy(e.currentTarget, async () => {
+        const tasks = await api('applyTemplate', { unitId: u.id, startDate: s.value });
+        tasks.forEach(t => S.data.tasks.push(t)); S.ver++;
+        closeModal(); refreshView(); toast('เพิ่ม ' + tasks.length + ' งานแล้ว', 'success');
+      });
+    }
+  });
+}
+
+/* --- Template item form --- */
+function templateForm(t, unitType) {
+  const isNew = !t;
+  if (isNew) { const rows = S.data.templates.filter(x => x.unitType === unitType); t = { unitType, seq: rows.reduce((m, x) => Math.max(m, Number(x.seq) || 0), 0) + 1, days: 1 }; }
+  const cats = Array.from(new Set(S.data.templates.map(x => x.category).filter(Boolean)));
+  openModal({
+    title: (isNew ? 'เพิ่มขั้นตอน' : 'แก้ไขขั้นตอน') + ' · ' + esc(t.unitType),
+    body: '<div class="form-grid">' +
+      field('ประเภทยูนิต', inp('unitType', t.unitType, 'list="ut-list"') + '<datalist id="ut-list">' + unitTypes().map(x => '<option value="' + esc(x) + '">').join('') + '</datalist>') +
+      field('ลำดับ', inp('seq', t.seq, 'type="number" min="1"')) +
+      field('หมวดงาน', inp('category', t.category, 'list="tc-list"') + '<datalist id="tc-list">' + cats.map(c => '<option value="' + esc(c) + '">').join('') + '</datalist>') +
+      field('จำนวนวัน', inp('days', t.days, 'type="number" min="1"')) +
+      field('ประมาณการค่าใช้จ่ายเริ่มต้น (บาท)', inp('estCost', t.estCost, 'type="number" step="0.01" min="0" placeholder="เว้นว่างได้"'), 'full', 'จะถูกคัดลอกไปเป็นค่าเริ่มต้นของงานเมื่อใช้แม่แบบ') +
+      field('ชื่องาน *', inp('title', t.title), 'full') +
+      field('รายละเอียดเริ่มต้น', '<textarea class="textarea" name="detail" rows="2">' + esc(t.detail) + '</textarea>', 'full') + '</div>',
+    foot: '<button class="btn" data-act="close-modal">ยกเลิก</button><button class="btn primary" id="tp-save">บันทึก</button>',
+    onMount: r => {
+      $('#tp-save', r).onclick = e => busy(e.currentTarget, async () => {
+        const d = formData(r); if (!d.title) throw new Error('กรุณาระบุชื่องาน');
+        d.seq = Number(d.seq) || 1; d.days = Math.max(1, Number(d.days) || 1); d.estCost = d.estCost === '' ? '' : toNum(d.estCost);
+        if (!isNew) d.id = t.id;
+        const rec = await api('saveTemplate', d);
+        upsertLocal('templates', rec); closeModal(); S.params.ttype = rec.unitType; refreshView(); toast('บันทึกแล้ว', 'success');
+      });
+    }
+  });
+}
+
+/* ---------------- 7) Photos ---------------- */
+function bindDropzones(root = document) {
+  $$('[data-drop]', root).forEach(z => {
+    z.ondragover = e => { e.preventDefault(); z.classList.add('over'); };
+    z.ondragleave = () => z.classList.remove('over');
+    z.ondrop = e => {
+      e.preventDefault(); z.classList.remove('over');
+      const files = Array.from(e.dataTransfer.files || []).filter(f => /^image\//.test(f.type));
+      if (files.length) uploadFiles(files, { unitId: z.dataset.unit, taskId: z.dataset.task, stage: z.dataset.stage });
+    };
+  });
+}
+function resizeImage(file, max = 1600, q = 0.82) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file), img = new Image();
+    img.onload = () => {
+      const s = Math.min(1, max / Math.max(img.width, img.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(img.width * s); c.height = Math.round(img.height * s);
+      const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      resolve(c.toDataURL('image/jpeg', q));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('อ่านไฟล์รูปไม่ได้: ' + file.name)); };
+    img.src = url;
+  });
+}
+async function uploadFiles(files, target) {
+  let ok = 0;
+  const t = toast('กำลังอัปโหลด 0/' + files.length + ' รูป…', '', 0);
+  for (let i = 0; i < files.length; i++) {
+    try {
+      const dataUrl = await resizeImage(files[i]);
+      const rec = await api('uploadPhoto', {
+        unitId: target.unitId, taskId: target.taskId || '', stage: target.stage,
+        fileName: files[i].name.replace(/\.[^.]+$/, '') + '.jpg', mimeType: 'image/jpeg',
+        base64: dataUrl.split(',')[1], dataUrl: window.MockAPI ? dataUrl : undefined
+      });
+      S.data.photos.push(rec); S.ver++; ok++;
+      t.querySelector('span').textContent = 'กำลังอัปโหลด ' + ok + '/' + files.length + ' รูป…';
+    } catch (e) { toast(e.message || String(e), 'error'); }
+  }
+  t.remove();
+  if (ok) toast('อัปโหลดสำเร็จ ' + ok + ' รูป', 'success');
+  refreshAfterPhotos(target.taskId);
+}
+function refreshAfterPhotos(taskId) {
+  const box = $('#tf-photos');
+  if (box && taskId) box.innerHTML = taskPhotosHtml(taskId);
+  if (S.view === 'unit') { render(); } else renderNav();
+}
+
+function photoList(p) {
+  // ลำดับรูปสำหรับเลื่อนดูใน Lightbox (ตามบริบทเดียวกัน)
+  if (p.taskId && $('#tf-photos')) return S.data.photos.filter(x => x.taskId === p.taskId);
+  if (S.view === 'unit') {
+    const tab = S.params.tab;
+    const all = photosOf(p.unitId);
+    if (tab === 'before') return all.filter(x => x.stage === STAGES[0]);
+    if (tab === 'gallery' && S.params.stage && S.params.stage !== 'all') return all.filter(x => x.stage === S.params.stage);
+    return all;
+  }
+  return [p];
+}
+function openLightbox(id) {
+  const p = S.data.photos.find(x => x.id === id); if (!p) return;
+  const list = photoList(p);
+  S.lb = { list, i: Math.max(0, list.findIndex(x => x.id === id)) };
+  drawLightbox();
+}
+function drawLightbox() {
+  const { list, i } = S.lb, p = list[i];
+  const u = unitById(p.unitId), t = p.taskId ? taskById(p.taskId) : null;
+  $('#lightbox-root').innerHTML = '<div class="lightbox">' +
+    '<div class="lb-top"><div class="grow">' + esc(u ? unitLabel(u) : '') + (t ? ' · ' + esc(t.title) : '') + ' · ' + esc(p.stage) + ' · ' + (i + 1) + '/' + list.length + '<br><span style="opacity:.7">' + esc(p.createdAt || '') + (p.uploadedBy ? ' · ' + esc(p.uploadedBy) : '') + '</span></div>' +
+      (p.view ? '<a class="icon-btn" href="' + esc(p.view) + '" target="_blank" title="เปิดใน Google Drive">' + ic('external', 18) + '</a>' : '') +
+      '<button class="icon-btn" data-act="lb-delete" title="ลบรูป">' + ic('trash', 18) + '</button><button class="icon-btn" data-act="lb-close" title="ปิด">' + ic('x', 22) + '</button></div>' +
+    '<div class="lb-stage"><img src="' + esc(p.url || p.thumb) + '" alt="">' +
+      (list.length > 1 ? '<button class="lb-nav prev" data-act="lb-prev">' + ic('back', 24) + '</button><button class="lb-nav next" data-act="lb-next">' + ic('next', 24) + '</button>' : '') + '</div>' +
+    '<div class="lb-bottom"><input class="input" id="lb-cap" placeholder="เพิ่มคำอธิบายรูป เช่น ผนังห้องนอนด้านทิศเหนือ" value="' + esc(p.caption) + '">' +
+      '<select class="select" id="lb-stage">' + STAGES.map(s => '<option' + (s === p.stage ? ' selected' : '') + '>' + esc(s) + '</option>').join('') + '</select>' +
+      '<button class="btn primary" data-act="lb-save">บันทึก</button></div></div>';
+}
+function closeLightbox() { $('#lightbox-root').innerHTML = ''; S.lb = null; }
+
+/* ---------------- Toast ---------------- */
+function toast(msg, type = '', ms = 2600) {
+  const el = document.createElement('div');
+  el.className = 'toast ' + type;
+  el.innerHTML = (type === 'success' ? ic('check', 16, 2.5) : type === 'error' ? ic('alert', 16) : '<span class="spinner sm" style="border-color:rgba(255,255,255,.3);border-top-color:#fff"></span>') + '<span>' + esc(msg) + '</span>';
+  $('#toast-root').appendChild(el);
+  if (ms) setTimeout(() => el.remove(), type === 'error' ? 5000 : ms);
+  return el;
+}
+
+/* ---------------- 8) Actions ---------------- */
+const ACTIONS = {
+  'nav': el => go(el.dataset.view),
+  'refresh': async () => { const t = toast('กำลังโหลดข้อมูลใหม่…', '', 0); try { setData(await api('bootstrap')); refreshView(); } catch (e) { toast(e.message, 'error'); } t.remove(); },
+  'open-unit': el => go('unit', { id: el.dataset.id, tab: 'tasks' }),
+  'sales-type': el => { S.filters.salesType = S.filters.salesType === el.dataset.type && el.dataset.type !== 'all' ? 'all' : el.dataset.type; render(); },
+  'print-plan': () => printPlanDialog(),
+  'pdf-drive': async el => {
+    if (!S.pdfFile) return;
+    await busy(el, async () => {
+      const rec = await api('savePdf', { fileName: S.pdfFile.name, base64: await blobToBase64(S.pdfFile.blob) });
+      const box = $('#pp-drive');
+      if (box) box.innerHTML = '<div class="pp-status ok">' + ic('check', 16, 2.5) + 'บันทึกลง Google Drive แล้ว — <a href="' + esc(rec.url) + '" target="_blank" rel="noopener">เปิดไฟล์</a></div>';
+      toast('บันทึก PDF ลง Drive แล้ว', 'success');
+    }).catch(() => {});
+  },
+  'goto-status': el => { S.filters.status = el.dataset.status; S.filters.type = 'all'; S.filters.q = ''; go('units'); },
+  'goto-project': el => { S.filters.project = el.dataset.id; S.filters.status = 'all'; go('units'); },
+  'filter-status': el => { S.filters.status = el.dataset.status; render(); },
+  'unit-tab': el => { S.params.tab = el.dataset.tab; render(); },
+  'gallery-stage': el => { S.params.stage = el.dataset.stage; render(); },
+  'settings-tab': el => { S.params.tab = el.dataset.tab; render(); },
+  'tpl-type': el => { S.params.ttype = el.dataset.type; render(); },
+  'new-project': () => projectForm(null),
+  'edit-project': el => projectForm(S.data.projects.find(p => p.id === el.dataset.id)),
+  'new-unit': el => unitForm(null, el.dataset.project ? { projectId: el.dataset.project } : {}),
+  'edit-unit': el => unitForm(unitById(el.dataset.id)),
+  'new-task': el => taskForm(null, el.dataset.unit),
+  'open-task': el => taskForm(taskById(el.dataset.id)),
+  'apply-template': el => applyTemplateForm(el.dataset.unit),
+  'new-template': el => templateForm(null, el.dataset.type),
+  'edit-template': el => templateForm(S.data.templates.find(t => t.id === el.dataset.id)),
+  'delete-template': async el => {
+    const t = S.data.templates.find(x => x.id === el.dataset.id);
+    if (!await confirmBox('ลบขั้นตอน “' + esc(t.title) + '” ออกจากแม่แบบ?\n(งานที่สร้างไปแล้วจะไม่ถูกลบ)', 'ลบ')) return;
+    try { await api('deleteTemplate', { id: t.id }); removeLocal('templates', x => x.id === t.id); render(); toast('ลบแล้ว', 'success'); } catch (e) { toast(e.message, 'error'); }
+  },
+  'toggle-done': async el => {
+    const t = taskById(el.dataset.id); if (!t) return;
+    const done = Number(t.progress) >= 100;
+    const d = Object.assign({}, t, { progress: done ? 50 : 100, finishDate: done ? '' : todayStr() });
+    upsertLocal('tasks', d); refreshView();               // อัปเดตทันที (optimistic)
+    try { upsertLocal('tasks', await api('saveTask', d)); refreshView(); toast(done ? 'ยกเลิกสถานะเสร็จ' : 'ทำเครื่องหมายเสร็จแล้ว', 'success'); }
+    catch (e) { upsertLocal('tasks', t); refreshView(); toast(e.message, 'error'); }
+  },
+  'mark-handed': async el => {
+    const u = unitById(el.dataset.id);
+    if (!await confirmBox('บันทึกว่าได้ส่งมอบ ' + esc(unitLabelLong(u)) + ' ให้ลูกค้าแล้ววันนี้ (' + fmtDLong(todayStr()) + ')?', 'บันทึกส่งมอบ', false)) return;
+    try { upsertLocal('units', await api('saveUnit', Object.assign({}, u, { handoverDate: todayStr() }))); refreshView(); toast('บันทึกการส่งมอบแล้ว', 'success'); } catch (e) { toast(e.message, 'error'); }
+  },
+  'pick-photos': el => {
+    S.upload = { unitId: el.dataset.unit, taskId: el.dataset.task, stage: el.dataset.stage };
+    const fi = $('#file-input'); fi.value = ''; fi.click();
+  },
+  'open-photo': el => openLightbox(el.dataset.id),
+  'lb-close': closeLightbox,
+  'lb-prev': () => { S.lb.i = (S.lb.i - 1 + S.lb.list.length) % S.lb.list.length; drawLightbox(); },
+  'lb-next': () => { S.lb.i = (S.lb.i + 1) % S.lb.list.length; drawLightbox(); },
+  'lb-save': async el => {
+    const p = S.lb.list[S.lb.i];
+    await busy(el, async () => {
+      const rec = await api('updatePhoto', { id: p.id, caption: $('#lb-cap').value.trim(), stage: $('#lb-stage').value });
+      Object.assign(p, rec); upsertLocal('photos', p); toast('บันทึกคำอธิบายแล้ว', 'success');
+      refreshAfterPhotos(p.taskId);
+    }).catch(() => {});
+  },
+  'lb-delete': async () => {
+    const p = S.lb.list[S.lb.i];
+    closeLightbox();
+    if (!await confirmBox('ลบรูปนี้? (ไฟล์ใน Google Drive จะถูกย้ายไปถังขยะ)', 'ลบรูป')) return;
+    try {
+      await api('deletePhoto', { id: p.id }); removeLocal('photos', x => x.id === p.id); toast('ลบรูปแล้ว', 'success');
+      refreshAfterPhotos(p.taskId);
+    } catch (e) { toast(e.message, 'error'); }
+  },
+  'close-modal': closeModal
+};
+
+document.addEventListener('click', e => {
+  const el = e.target.closest('[data-act]');
+  if (!el) return;
+  const fn = ACTIONS[el.dataset.act];
+  if (fn) { e.preventDefault(); e.stopPropagation(); fn(el, e); }
+});
+document.addEventListener('keydown', e => {
+  if (S.lb) {
+    if (e.key === 'Escape') closeLightbox();
+    if (e.target.tagName === 'INPUT') return;
+    if (e.key === 'ArrowLeft') ACTIONS['lb-prev']();
+    if (e.key === 'ArrowRight') ACTIONS['lb-next']();
+  } else if (e.key === 'Escape' && $('#modal-root').innerHTML) closeModal();
+});
+$('#file-input').addEventListener('change', e => {
+  const files = Array.from(e.target.files || []);
+  if (files.length && S.upload) uploadFiles(files, S.upload);
+});
+
+/* ---------------- Init ---------------- */
+function setData(d) {
+  S.data = Object.assign({ projects: [], units: [], tasks: [], photos: [], templates: [], meta: {} }, d);
+  S.ver++;
+}
+async function init() {
+  $('#brand-logo').innerHTML = ic('home', 22, 2);
+  $('#brand-logo-m').innerHTML = ic('home', 18, 2);
+  $('#btn-refresh-m').innerHTML = ic('refresh', 18);
+  try {
+    setData(await api('bootstrap'));
+    const mt = S.data.meta;
+    $('#side-foot').innerHTML = (mt.user ? '<div class="user">' + ic('user', 16) + esc(mt.user) + '</div>' : '') + '<div>เวอร์ชัน ' + esc(mt.version || '') + '</div>';
+    if (mt.demo) $('#demo-banner').innerHTML = '<div class="demo-banner">' + ic('info', 16) + 'โหมดตัวอย่าง — ข้อมูลจำลองในเบราว์เซอร์ ไม่ได้บันทึกลง Google Sheet</div>';
+    $('#loading').classList.add('hide');
+    go('dashboard');
+  } catch (e) {
+    $('#loading').innerHTML = '<div style="text-align:center;max-width:420px;padding:20px">' + ic('alert', 36) + '<h3 style="margin:10px 0">โหลดข้อมูลไม่สำเร็จ</h3><div class="muted">' + esc(e.message || e) + '</div><button class="btn primary" style="margin-top:16px" onclick="location.reload()">ลองใหม่</button></div>';
+  }
+}
+init();
+</script>
